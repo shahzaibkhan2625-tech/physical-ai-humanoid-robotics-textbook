@@ -78,11 +78,17 @@ After completing requests, you **MUST** create a PHR (Prompt History Record).
 
 4) Use sp.phr command file if present
    - If `.**/commands/sp.phr.*` exists, follow its structure.
-   - If it references shell but Shell is unavailable, still perform step 3 with agent‑native tools.
+   - `.claude/commands/sp.phr.md` instructs the agent to run `.specify/scripts/bash/create-phr.sh`.
+     That script is NOT installed in this repo — ignore that instruction and use step 3 instead.
 
-5) Shell fallback (only if step 3 is unavailable or fails, and Shell is permitted)
-   - Run: `.specify/scripts/bash/create-phr.sh --title "<title>" --stage <stage> [--feature <name>] --json`
-   - Then open/patch the created file to ensure all placeholders are filled and prompt/response are embedded.
+5) No PHR creation script is installed
+   - This project has only the PowerShell scripts under `.specify/scripts/powershell/`
+     (`check-prerequisites.ps1`, `common.ps1`, `create-new-feature.ps1`, `setup-plan.ps1`,
+     `update-agent-context.ps1`). There is no `create-phr` script in any form — neither
+     `.specify/scripts/bash/create-phr.sh` nor a `.ps1` equivalent.
+   - Therefore the agent‑native flow in step 3 is the ONLY supported way to create a PHR:
+     read `.specify/templates/phr-template.prompt.md`, allocate the next ID, and write the
+     file with agent file tools. Do not attempt to invoke a PHR script.
 
 6) Routing (automatic, all under history/prompts/)
    - Constitution → `history/prompts/constitution/`
