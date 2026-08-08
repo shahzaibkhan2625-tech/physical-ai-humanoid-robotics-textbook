@@ -1,0 +1,14 @@
+# Node
+node_modules/
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Docusaurus build output
+book/build/
+book/.docusaurus/
