@@ -5,4 +5,105 @@ slug: /
 
 # Introduction
 
-Placeholder page. Book content is added in a later phase.
+Software AI is judged on its output. Physical AI is judged on what it does to the world. A
+language model that produces a wrong sentence can be corrected by reading the next one; a robot
+that takes a wrong step falls over, and nothing about the situation resets when you notice. The
+moment intelligence gets a body, it inherits sensors that lie, actuators that lag, and actions
+that cannot be undone.
+
+This book is about building that kind of system — specifically, a humanoid robot that can hear a
+spoken instruction, work out what to do about it, and act on it in a physics simulation. You will
+build one robot across four modules, and each module adds a layer it did not have before.
+
+## Who this book is for
+
+You should be comfortable writing Python: functions, classes, imports, virtual environments,
+reading a traceback. That is the whole prerequisite. Nothing here re-teaches Python, and no
+chapter pauses to explain a list comprehension.
+
+You are assumed to know **nothing** about robotics. No ROS, no simulation, no control theory, no
+kinematics, no prior experience with a physical robot. Every robotics concept the book uses is
+introduced before it is used. Where a chapter needs something an earlier chapter taught, it links
+back rather than explaining it twice — so reading front to back is the intended path, and skipping
+ahead will cost you.
+
+The depth is deliberately moderate. Each chapter is a single sitting: enough theory to understand
+why a mechanism exists, one or two code examples that run exactly as printed, and a few short
+exercises to check yourself. This is not an API reference, and it does not try to be exhaustive.
+The goal is a reader who can build something and then go read the official documentation with the
+context to understand it.
+
+## What you need before you start
+
+The book targets one platform and names it in every chapter, so you never have to guess which
+version a command belongs to:
+
+| Component | Version |
+|---|---|
+| ROS 2 | Jazzy Jalisco |
+| Operating system | Ubuntu 24.04 LTS (Noble Numbat) |
+| Simulator | Gazebo Harmonic |
+
+Both ROS 2 Jazzy and Gazebo Harmonic are long-term-support releases with support windows running
+to May 2029, and Harmonic is the pairing officially supported alongside Jazzy. Ubuntu 24.04 is
+Jazzy's Tier 1 platform. If you are on Windows or macOS, the practical route is a virtual machine
+or a container running Ubuntu 24.04 — the examples assume Linux.
+
+Module 3 asks for more: its examples use NVIDIA Isaac, which requires an RTX-class GPU. That
+module is written so that a reader without one can still follow every idea in it, and each of its
+chapters states the requirement up front.
+
+Reference documentation for the two main platforms:
+[ROS 2 Jazzy](https://docs.ros.org/en/jazzy/) and
+[Gazebo Harmonic](https://gazebosim.org/docs/harmonic/getstarted/).
+
+## How the four modules fit together
+
+The four modules are not four topics. They are four layers of one machine, and each one is
+useless without the one beneath it.
+
+**Module 1 — ROS 2: The Robotic Nervous System.** A robot is not one program. It is a dozen
+programs — one reading a camera, one estimating position, one driving joints — that must exchange
+data continuously without sharing memory or crashing each other. ROS 2 is the middleware that
+carries those messages, the same way a nervous system carries signals between organs that never
+touch. Module 1 teaches how those programs find each other and talk, and ends by describing the
+robot's body in a format machines can read.
+
+**Module 2 — Gazebo & Unity: The Digital Twin.** Your robot does not exist yet, and even when it
+does you will not want to discover a bug by watching it fall down a staircase. A simulator gives
+the robot a world with gravity, contact, and friction, plus sensors that produce data of the same
+shape a real sensor would. This is where the body from Module 1 first stands up — and, at first,
+falls over. Understanding *why* it falls is the point of the module.
+
+**Module 3 — NVIDIA Isaac: The AI-Robot Brain.** A robot that can move but does not know where it
+is can do nothing useful. This module supplies perception and navigation: generating synthetic
+training data, running visual SLAM so the robot can answer "where am I", and configuring Nav2 so
+it can answer "how do I get there" — including the ways a two-legged robot breaks assumptions
+built for wheels.
+
+**Module 4 — Vision-Language-Action (VLA).** The final layer connects a human sentence to robot
+motion: speech becomes text, text becomes a plan expressed in skills the robot actually has, and
+that plan is validated before any of it reaches an actuator. That validation step is the module's
+central lesson — an unchecked language-model plan driving a physical joint is a safety failure,
+not a rough edge.
+
+Read downward and you have a stack: messages, then a world, then perception, then language.
+
+## What you will build
+
+One robot, four modules.
+
+In Module 1 you describe a simple humanoid — torso, head, two arms, two legs — in URDF, the
+machine-readable body description that everything downstream consumes. That same model is the
+robot for the rest of the book. Module 2 spawns it in a simulated world and hangs LiDAR, a depth
+camera, and an IMU on it. Module 3 gives it the ability to localize itself and plan a path.
+Module 4 puts a microphone in front of it: you speak an instruction, a transcription model turns
+it into text, a language model decomposes it into a sequence of known skills, each step is checked
+against what the robot can actually do, and the accepted steps become navigation goals the
+simulated humanoid carries out.
+
+The capstone assembles all of it into one system you can run end to end, introduces no new
+concepts, and closes with an honest account of what the system cannot do and what real hardware
+would additionally demand.
+
+Start with Module 1. Everything else stands on it.
