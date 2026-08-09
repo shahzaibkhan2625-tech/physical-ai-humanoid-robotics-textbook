@@ -1,0 +1,74 @@
+---
+sidebar_position: 1
+title: "Module 1 — ROS 2: The Robotic Nervous System"
+---
+
+# Module 1 — ROS 2: The Robotic Nervous System
+
+A robot is never one program. One process reads a camera, another estimates where the body is,
+another drives the joints, and a fourth decides what to do next. They run at different rates, they
+start and stop at different times, and they do not share memory. Something has to carry data
+between them without letting a slow process freeze a fast one, and without every program needing
+to know the address of every other program.
+
+That something is middleware, and for modern robotics it is ROS 2. This module is about how those
+programs find each other and talk — and, at the end, how you describe the robot's physical body in
+a form all of them can read.
+
+## What this module covers
+
+**Introduction to Physical AI & Embodied Intelligence** establishes what changes when software
+gets a body: the sense–think–act loop, and why noisy sensors, latency, actions you cannot undo,
+and the gap between a simulator and the world make embodied problems harder than software-only
+ones. It also maps the book's four modules onto the layers of one system.
+
+**ROS 2 Architecture: Nodes, Topics, Services** introduces the three things you need to read any
+ROS 2 system: nodes as units of computation, topics for continuous streaming data, and services
+for request/response. It also covers inspecting a running system from the command line, which is
+the skill you will lean on every time something does not work.
+
+**Bridging Python Agents with rclpy** is where you write ROS 2 code. Node lifecycle, publishers,
+subscribers, timers, and parameters — enough `rclpy` to be productive — plus why a callback that
+blocks stalls the whole node. The agent-node skeleton built here is reused for the rest of the
+book.
+
+**URDF: Describing a Humanoid** answers a question the first three chapters leave open: what is
+the robot, physically? You build a simple humanoid — torso, head, two arms, two legs — as links
+and joints, and learn why visual, collision, and inertial geometry are three different things.
+That model is the robot for every module that follows.
+
+## What you need first
+
+**Background.** Python: functions, classes, imports, virtual environments, reading a traceback.
+No robotics background is assumed. Nothing in this module expects prior experience with ROS,
+simulation, control theory, or hardware.
+
+**Software.** The book targets one platform and names it in every chapter:
+
+| Component | Version |
+|---|---|
+| ROS 2 | Jazzy Jalisco |
+| Operating system | Ubuntu 24.04 LTS (Noble Numbat) |
+
+The first chapter is plain Python and runs anywhere Python 3 does. The remaining three need a
+working ROS 2 Jazzy installation on Ubuntu 24.04 — Jazzy's Tier 1 platform. On Windows or macOS,
+use a virtual machine or a container running Ubuntu 24.04. Installation instructions are in the
+[ROS 2 Jazzy documentation](https://docs.ros.org/en/jazzy/Installation.html).
+
+**Hardware.** Nothing beyond an ordinary computer. No GPU, no robot, no sensors. Later modules ask
+for more; this one does not.
+
+## What you will be able to do at the end
+
+- Explain what makes an AI system *physical*, and name the three stages of the sense–think–act
+  loop.
+- Describe what a node, a topic, and a service are, and choose the right one for a given need.
+- Inspect a running ROS 2 system from the command line.
+- Write an `rclpy` node from a blank file that subscribes to data, decides something, and
+  publishes a command — then run it.
+- Read a URDF and describe the robot it defines, and extend the book's humanoid with a new link
+  and joint.
+
+A reader who stops here has still learned a complete skill: they can write Python programs that
+participate in a real ROS 2 system, and describe a robot's body in a machine-readable form. Every
+later module builds on exactly these two abilities.

@@ -1,0 +1,352 @@
+---
+sidebar_position: 2
+title: Introduction to Physical AI & Embodied Intelligence
+---
+
+# Introduction to Physical AI & Embodied Intelligence
+
+A spam classifier can be wrong ten thousand times a day and the world absorbs it. A robot that is
+wrong once can be lying on the floor with a broken wrist. This chapter is about that difference —
+what changes when a model stops producing answers and starts producing motion — and about the loop
+every robot runs for its entire operating life.
+
+## Learning objectives
+
+By the end of this chapter you will be able to:
+
+- Explain what makes an AI system *physical*, and how it differs from a software-only one.
+- Name the three stages of the sense–think–act loop and give a concrete example of each.
+- Name the four properties of the physical world that make embodied problems hard, and explain
+  what each one costs a robot.
+- Say which module of this book owns which stage of the loop.
+
+## Software AI answers; physical AI acts
+
+A software-only model has a clean contract. A classifier is handed an email and returns a label; a
+language model is handed a prompt and returns tokens. Input arrives, output leaves, and whatever
+happens next is somebody else's problem. Two properties follow, and both are load-bearing: the
+output does not change the input the model will be given next, and every output can be inspected
+before anything is done about it.
+
+Physical AI breaks both at once. Suppose a robot decides to turn left. The very next camera frame
+it receives is different *because it turned left* — its own output has become part of its next
+input, through the world. And by the time anyone could have inspected that decision, the robot has
+already turned. The actuator does not wait for a review.
+
+That feedback path is the definition worth keeping:
+
+> An AI system is **physical** when its own actions change the data it will receive next.
+
+The criterion is not that the system is made of metal, but that it sits inside a closed loop with
+the world, so its mistakes accumulate instead of being independently sampled. You cannot evaluate
+such a system on a fixed test set, because the test set it faces is one it generates for itself,
+one decision at a time. A small steering error puts the robot somewhere it has never been, where
+its next decision is worse. **Embodiment** is the word for that body and that feedback path:
+intelligence that has to live with the consequences of being wrong.
+
+## The sense–think–act loop
+
+Strip away every difference between robots, and the same three stages remain.
+
+**Sense** turns physical quantities into numbers. A camera turns light into a pixel array; a joint
+encoder turns the rotation of a motor shaft into an angle; an inertial measurement unit (IMU) turns
+the body's acceleration and rotation into six numbers; a LiDAR turns time-of-flight into a list of
+distances. For the humanoid you will build, sensing means: what angle is every joint at, how fast
+is the torso tipping, and how far away is the nearest obstacle.
+
+**Think** turns numbers into a decision, and almost always has two jobs stacked on each other.
+First, *estimate the state*: from a stream of measurements, work out where the robot is and what is
+around it — no sensor reports this directly. Second, *choose an action*: given that estimate and a
+goal, decide what to do. Recognising an object, computing a route, and picking a skill to run are
+all "think".
+
+**Act** turns a decision into something an actuator can execute. Actuators do not accept plans;
+they accept a target joint angle, a velocity, or a torque. Everything between "walk to the kitchen"
+and a number arriving at a motor is the act stage doing translation.
+
+Then it repeats — and the repetition is the part beginners underestimate. A loop is not a function
+call, it is a **cadence**. At 10 Hz, the robot commits to a decision and acts on it, unsupervised,
+for 100 milliseconds before it looks again. Whatever happens in that window happens without a
+decision being made about it.
+
+Real robots run many loops at different rates: balance at hundreds of cycles per second, perception
+at camera frame rate, planning at a few cycles per second. Those loops are separate programs that
+must exchange data continuously without waiting for each other — precisely the problem the rest of
+this module exists to solve.
+
+## Why embodiment makes problems hard
+
+Four properties of the physical world do the damage. Every failure you will debug in this book is
+one of them wearing a costume.
+
+### The world does not wait
+
+An object falling one metre under Earth's gravity of about 9.81 m/s² reaches the floor in roughly
+0.45 seconds. A robot that notices it is tipping over is working on that timescale, and at a 10 Hz
+control loop that is four or five opportunities to act — total. Thinking harder for another second
+is not on the menu.
+
+Latency is therefore a correctness property, not a performance one. A decision computed from
+300-millisecond-old data is a decision about a world that no longer exists, however good the
+algorithm. "Fast enough" is a deadline, and missing it is a wrong answer, not a slow one.
+
+### Sensors do not report the truth
+
+A sensor does not tell you the distance to the wall. It gives you a *measurement* of that distance,
+corrupted by noise, offset by a bias, delayed by however long the sensor and its driver took,
+occasionally missing entirely, and valid only within some range. Two readings of an unchanged world
+will differ.
+
+There is no second channel reporting the real value — if there were, you would use that one
+instead. The robot's true state is never observed, only estimated, so any code that treats a single
+reading as fact is already wrong; the only question is by how much. This is why the state
+estimation half of "think" exists, and why the example below makes the true position unreadable by
+the robot's own logic.
+
+### Actions cannot be undone
+
+There is no rollback for a robot that has knocked a cup off a table, and no exception handler that
+catches a fall. Software gets undo, retries, and transactions almost for free; embodied systems get
+none.
+
+Costs are therefore asymmetric, so the engineering must be too. Stopping half a metre short of a
+wall costs you half a metre; stopping half a metre late costs you a repair. That asymmetry is why
+real robot code is full of margins, sanity checks on incoming data, and validation of a plan
+*before* any of it reaches an actuator — a habit this book returns to when a language model starts
+generating those plans.
+
+### The simulator is not the world
+
+You will develop in simulation, because it is cheap, safe, resettable, and available at three in
+the morning. But a simulator is a model of physics, not physics. Contact, friction, actuator
+response, and sensor noise are all approximations, and a controller tuned until it works perfectly
+against one simulator's approximations can fail immediately on hardware. That discrepancy is the
+**sim-to-real gap**, the standing tax on everything simulation gives you.
+
+It is managed rather than eliminated. The best-known technique is called *domain randomization*,
+demonstrated for transferring vision models from simulation to real robots by
+[Tobin et al. (2017)](https://arxiv.org/abs/1703.06907); later in this book you will generate
+exactly that kind of randomised data.
+
+## Why humanoids
+
+The strongest argument for a human-shaped robot is not about the robot. It is about the buildings.
+Stair risers, door handles, light switches, counter heights, and tool grips were all dimensioned
+around human bodies. A machine with roughly human proportions can work in that environment without
+anyone rebuilding it, where a wheeled robot needs ramps, automatic doors, and fixtures moved. You
+can change the robot or change the world, and changing the robot is usually cheaper. The second
+argument is generality: one body with legs, arms, and hands is re-tasked in software, where a
+purpose-built machine is re-tooled in hardware.
+
+The honest counter-argument is that legs are expensive. A two-legged robot does not stand up by
+being built correctly; it stays upright by continuously correcting itself, so it needs a fast,
+reliable sense–think–act loop *before* it can do anything useful at all. Wheels on a flat floor are
+cheaper, more stable, and more energy-efficient. Keeping a biped balanced is a genuinely open
+engineering problem, and this book does not solve it — it shows you where the problem lives.
+
+For a textbook the humanoid is nonetheless the right choice, precisely because it is the demanding
+case: a wheeled robot lets you fake several layers and still see something move, and a humanoid
+does not.
+
+## The four modules as layers of one loop
+
+The four modules are not four topics; each builds part of the loop above.
+
+| Loop stage | What must exist | Where this book builds it |
+|---|---|---|
+| Sense | sensors producing data at all | Module 2 — simulated LiDAR, depth camera, IMU |
+| Sense → Think | that raw data turned into "where am I" | Module 3 — visual SLAM (simultaneous localization and mapping), giving a position estimate and a map |
+| Think | a goal, taken from a human | Module 4 — speech to text to a validated plan |
+| Think | a route to that goal | Module 3 — Nav2 planning, with the biped caveats |
+| Act | a command reaching the body | Module 1 — ROS 2 messaging |
+| → Sense | consequences in the world | Module 2 — the physics engine |
+
+The short version: **sense** is produced by Module 2 and interpreted by Module 3; **think** is
+split, with Module 4 deciding *what* to do and Module 3 working out *how* to get there; **act** is
+carried by Module 1. Module 2's physics then decides what the world does in response, which is what
+the next **sense** reads — that last row is the loop closing.
+
+Module 1 — this module — has a different role. It does not own a stage; it owns every arrow between
+them. The transport that carries a measurement from sense to think, and a command from think to
+act, is what ROS 2 provides, and the description of the body those commands act on is what you
+write at the end of this module. That is why it comes first: the other three modules are stages,
+and this one is the wiring.
+
+## Code example: the loop before the middleware
+
+Before any middleware, simulator, or robot, the loop is worth seeing on its own — seventy-odd lines
+of ordinary Python with no libraries hiding any of it.
+
+The program models a robot driving straight at a wall one metre away, which must stop 0.30 m short.
+Its only sensor is a range finder with up to 2 cm of error, and — the important structural choice —
+the decision function is only ever handed the *measurement*. The true position lives in `World` and
+the thinking code cannot reach it, exactly as on a real robot.
+
+**Environment.** This example needs only **Python 3.8 or newer** and the standard library — no
+ROS 2, no simulator, no third-party packages — so it runs unchanged on Windows, macOS, or Linux. It
+is the only example in this module with no ROS 2 dependency; the other chapters target the book's
+platform, **ROS 2 Jazzy Jalisco on Ubuntu 24.04 (Noble)**. The output below was produced with
+Python 3.14.2. The sensor noise is seeded with a fixed value, and the standard library
+[guarantees](https://docs.python.org/3/library/random.html) that a given seed produces the same
+sequence from `random()` across Python versions, so your numbers will match the ones printed here.
+
+```python
+"""A minimal sense-think-act loop: a robot driving toward a wall.
+
+No robotics libraries, no ROS. The World class stands in for physical reality.
+"""
+
+import random
+
+DT = 0.1             # seconds of world time per cycle, so the loop runs at 10 Hz
+WALL_X = 1.00        # m: where the wall actually is
+SENSOR_ERROR = 0.02  # m: worst-case error of the range sensor
+STOP_GAP = 0.30      # m: how far short of the wall we want to stop
+SLOW_GAP = 0.50      # m: gap at which we stop cruising and start creeping
+CRUISE_SPEED = 1.00  # m/s
+CREEP_SPEED = 0.30   # m/s
+MAX_CYCLES = 40
+
+
+class World:
+    """Everything outside the robot's program: its body and its surroundings."""
+
+    def __init__(self, seed):
+        self.x = 0.0            # true position, which the robot never gets to read
+        self.contact = False    # True once the robot has touched the wall
+        self._rng = random.Random(seed)
+
+    def sense(self):
+        """Return a *measurement* of the gap to the wall, not the gap itself."""
+        true_gap = WALL_X - self.x
+        error = (self._rng.random() - 0.5) * 2.0 * SENSOR_ERROR
+        return true_gap + error
+
+    def act(self, speed):
+        """Apply one command for one time step, then let physics happen."""
+        self.x += speed * DT
+        if self.x >= WALL_X:
+            self.x = WALL_X
+            self.contact = True
+
+
+def think(measured_gap):
+    """Choose a speed using only what was measured."""
+    if measured_gap <= STOP_GAP:
+        return 0.0
+    if measured_gap <= SLOW_GAP:
+        return CREEP_SPEED
+    return CRUISE_SPEED
+
+
+def main():
+    world = World(seed=7)
+    speed = None
+
+    for cycle in range(MAX_CYCLES):
+        measured_gap = world.sense()      # SENSE
+        speed = think(measured_gap)       # THINK
+        world.act(speed)                  # ACT
+
+        print(
+            f"cycle {cycle:2d}  t={cycle * DT:4.1f}s  "
+            f"measured_gap={measured_gap:5.3f}  speed={speed:4.2f}  "
+            f"true_x={world.x:5.3f}"
+        )
+
+        if speed == 0.0:
+            break
+
+    final_gap = WALL_X - world.x
+    print()
+    print(f"stopped: {speed == 0.0}")
+    print(f"true gap at the end: {final_gap:.3f} m (aimed for {STOP_GAP:.2f} m)")
+    print(f"stopping error: {final_gap - STOP_GAP:+.3f} m")
+    print(f"touched the wall: {world.contact}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Save it as `sense_think_act.py` and run `python sense_think_act.py`:
+
+```text
+cycle  0  t= 0.0s  measured_gap=0.993  speed=1.00  true_x=0.100
+cycle  1  t= 0.1s  measured_gap=0.886  speed=1.00  true_x=0.200
+cycle  2  t= 0.2s  measured_gap=0.806  speed=1.00  true_x=0.300
+cycle  3  t= 0.3s  measured_gap=0.683  speed=1.00  true_x=0.400
+cycle  4  t= 0.4s  measured_gap=0.601  speed=1.00  true_x=0.500
+cycle  5  t= 0.5s  measured_gap=0.495  speed=0.30  true_x=0.530
+cycle  6  t= 0.6s  measured_gap=0.452  speed=0.30  true_x=0.560
+cycle  7  t= 0.7s  measured_gap=0.440  speed=0.30  true_x=0.590
+cycle  8  t= 0.8s  measured_gap=0.391  speed=0.30  true_x=0.620
+cycle  9  t= 0.9s  measured_gap=0.377  speed=0.30  true_x=0.650
+cycle 10  t= 1.0s  measured_gap=0.333  speed=0.30  true_x=0.680
+cycle 11  t= 1.1s  measured_gap=0.304  speed=0.30  true_x=0.710
+cycle 12  t= 1.2s  measured_gap=0.287  speed=0.00  true_x=0.710
+
+stopped: True
+true gap at the end: 0.290 m (aimed for 0.30 m)
+stopping error: -0.010 m
+touched the wall: False
+```
+
+Four things in that output matter more than the code that produced them.
+
+**The three stages are three lines.** `world.sense()`, `think(...)`, `world.act(...)`, in that
+order, forever. What changes later is what supplies them, not their shape: the data will cross
+process boundaries instead of function calls, `World` will be replaced by a physics simulator, and
+on real hardware `sense` becomes a sensor driver and `act` a motor driver. The loop body does not
+change.
+
+**The robot never reads the truth.** `world.x` exists in the program, but `think` is handed only
+`measured_gap`. That is the sensor lesson enforced by structure: any version of this program whose
+decision code reaches into `world.x` could not exist on a robot.
+
+**Three centimetres of blind travel became one centimetre of stopping error.** The final gap is
+0.290 m against a target of 0.300 m, and no line is buggy. Creeping at `CREEP_SPEED * DT` the robot
+covers 0.03 m per cycle, so the true gap steps 0.32 → 0.29, straight past the threshold, and it
+stops on the first cycle it can — already a centimetre short. Sensor noise made that last reading
+3 mm low but changed nothing here: zero the noise term and the run is identical. On other seeds it
+does shift where the robot stops. Physical systems do not hit their targets, they land near them,
+and the job is to know how near.
+
+**Between decisions, the robot is blind.** At cruise it covers 0.10 m per cycle with no new
+information — `CRUISE_SPEED * DT`, the latency problem in one multiplication. It is also why
+`STOP_GAP` exists.
+
+## Exercises
+
+Each exercise is a small edit to the program above. Run it, compare with the described result, then
+restore the original value.
+
+**1. Delete the safety margin.** Set `STOP_GAP = 0.00` so the robot aims to stop exactly at the
+wall.
+*Correct result*: the run ends with `touched the wall: True`. Write one sentence explaining what
+the 0.30 m margin was buying, given that the sensor is only wrong by 2 cm.
+
+**2. Slow the loop down.** Restore `STOP_GAP = 0.30` and set `DT = 0.5`, so the loop runs at 2 Hz
+instead of 10 Hz. Change nothing else — the speeds stay the same.
+*Correct result*: the run finishes in four cycles instead of thirteen, and the stopping error grows
+from about −0.010 m to about −0.100 m. The decision logic is untouched, so say where the extra
+error came from.
+
+**3. Change the sensor's luck.** Restore `DT = 0.1` and rerun with several values of `seed` in
+`World(seed=7)` — try 1, 2, 3, and 42.
+*Correct result*: the final gap and the stopping error change from seed to seed, staying within a
+few centimetres of the 0.30 m target, and `touched the wall` stays `False` throughout. The program is
+identical across those runs; only the sensor noise differs. This is what "you cannot evaluate a
+physical system on a fixed test set" means in practice.
+
+**4. Make the robot slow down smoothly.** Rewrite `think` so that instead of two fixed
+speeds it returns `0.0` when the measured gap is at or below `STOP_GAP`, and otherwise
+`min(CRUISE_SPEED, measured_gap - STOP_GAP)`. Raise `MAX_CYCLES` to `200` so the run has room to
+finish.
+*Correct result*: the stopping error shrinks to under a centimetre, but the run takes about three
+and a half times as many cycles. Name which of this chapter's four hard properties you just traded against
+which.
+
+Once you can explain all four results in terms of noise, latency, irreversibility, and loop rate,
+you are ready for the next question: how do the three stages talk to each other once they are no
+longer function calls in one Python file?
