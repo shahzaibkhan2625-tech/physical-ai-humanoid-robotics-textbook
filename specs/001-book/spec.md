@@ -509,11 +509,33 @@ after chapters are written is expensive — flag disagreement before implementat
 
 1. **14 chapters, distributed 4 / 4 / 3 / 3.** This is the chapter list as given in the request,
    taken as authoritative and fixed.
-2. **Target platform is the current ROS 2 LTS and its paired simulator release** — expected to be
-   ROS 2 Jazzy Jalisco with Gazebo Harmonic on Ubuntu 24.04. The planning phase MUST re-verify
-   against docs.ros.org and gazebosim.org whether a newer LTS has superseded this before any
-   chapter is written; whatever it confirms becomes the book-wide target, named in every chapter
+2. **Target platform is CONFIRMED as ROS 2 Jazzy Jalisco + Gazebo Harmonic on Ubuntu 24.04
+   (Noble)**, verified 2026-08-09. This is the book-wide target and MUST be named in every chapter
    per FR-014.
+
+   - Jazzy Jalisco: released 2024-05-23, LTS, supported to 2029-05; Tier 1 platform Ubuntu 24.04.
+     Still actively maintained — Patch Release 8 shipped 2026-06-18.
+   - Gazebo Harmonic: LTS, supported to 2029-05; the official `ros_gz` pairing for Jazzy.
+     Support windows align, so the pair goes end-of-life together.
+
+   **A newer LTS exists and was deliberately not chosen.** ROS 2 Lyrical Luth (released
+   2026-05-22, LTS to 2031-05, Ubuntu 26.04, paired with Gazebo Jetty) supersedes Jazzy on
+   currency. It is rejected because **NVIDIA Isaac ROS — which Module 3 depends on entirely —
+   states that all its packages are designed and tested against ROS 2 Jazzy on Ubuntu 24.04, and
+   does not mention Lyrical or Ubuntu 26.04**. Isaac Sim likewise lists only Humble and Jazzy as
+   officially tested, recommending Jazzy on 24.04. Targeting Lyrical would make Module 3's code
+   examples unverifiable, breaking Constitution Principle II (runnable code only) — so the oldest
+   dependency in the stack, not the newest release, sets the target.
+
+   *Consequence for chapters*: Jazzy's canonical `rclpy` idiom is
+   `rclpy.init(args=args)` … `destroy_node()` … `rclpy.shutdown()`. The context-manager form
+   (`with rclpy.init(args=args):`, with `ExternalShutdownException` handling) and the experimental
+   `rclpy.experimental.AsyncNode` are Lyrical-era and MUST NOT appear in chapter code. The Node
+   API itself — `create_publisher`, `create_subscription`, `create_timer`, `spin`, `get_logger` —
+   is unchanged between the two.
+
+   *Re-verification trigger*: revisit this decision if Isaac ROS publishes Lyrical support, or
+   before Jazzy's 2029-05 end of life, whichever comes first.
 3. **One running humanoid, authored in Chapter 1.4** — a simple custom URDF rather than a
    third-party model. Rationale: it keeps the book self-contained, avoids a licensing and
    availability dependency, and makes Chapter 1.4 produce something the rest of the book uses.
