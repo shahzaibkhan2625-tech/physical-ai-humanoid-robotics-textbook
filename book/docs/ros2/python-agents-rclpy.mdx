@@ -1,0 +1,506 @@
+---
+sidebar_position: 4
+title: Bridging Python Agents with rclpy
+---
+
+# Bridging Python Agents with rclpy
+
+[Chapter 1.2](./ros2-architecture.mdx) left a job half done. Its `pilot` node subscribed to `/gap`,
+worked out cruise, creep, or stop — and then dropped the decision on the floor. This chapter
+finishes it: the pilot publishes its command, and the sense–think–act loop from
+[Chapter 1.1](./physical-ai-embodied-intelligence.mdx) closes for the first time across process
+boundaries instead of inside one Python file.
+
+Getting there means learning `rclpy` properly — how a node starts and stops, how publishers,
+subscribers, and timers hang off it, how parameters retune a running robot, and what happens when
+one callback takes too long.
+
+## Learning objectives
+
+By the end of this chapter you will be able to:
+
+- Write an `rclpy` node from a blank file that both subscribes to a topic and publishes to another.
+- Run it, and change its behaviour from the command line without restarting it.
+- Explain why long work inside a callback stalls the whole node.
+
+## rclpy takes the main loop away from you
+
+Every program in [Chapter 1.1](./physical-ai-embodied-intelligence.mdx) had a `for` loop you could
+point at: you wrote the loop, and it called sense, think, and act in turn. Ordinary Python — your
+code is in charge, and libraries are things it calls.
+
+A node cannot work that way, because it does not decide when it has work. A message arrives when
+some other process sends one; a timer expires when the clock says so; a service request lands when a
+client calls. Something has to wait on all of those at once and dispatch each to the right piece of
+your code.
+
+That something is `rclpy`, and the price is inversion of control. You do not write the loop. You
+write the *reactions* — functions called **callbacks** — register them, and hand your thread to
+`rclpy` for the rest of the program's life. Your code stops being a program with a beginning and an
+end, and becomes a set of responses attached to a running system.
+
+Everything below targets **ROS 2 Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**.
+
+## The lifecycle of a node
+
+Four steps, in the same order, in every `rclpy` program in this book.
+
+**`rclpy.init(args=args)`** starts the ROS 2 context: the client library loads, the middleware comes
+up, and arguments after `--ros-args` are parsed. Nothing ROS-related works before it.
+
+**Construct the node.** Subclass `Node`, call `super().__init__('name')` with the name the graph will
+address it by, and create publishers, subscribers, timers, and parameters in the constructor. This
+is registration only — nothing is received yet.
+
+**`rclpy.spin(node)`** blocks and processes events until the context shuts down, normally when you
+press `Ctrl+C`. A node that is not being spun is inert.
+
+**`node.destroy_node()`** then **`rclpy.shutdown()`** release the node's publishers, subscriptions,
+timers, clients, and services, then tear the context down.
+
+Written out, that is the skeleton every ROS 2 example in this book reuses:
+
+```python
+import rclpy
+from rclpy.node import Node
+
+
+class MyNode(Node):
+
+    def __init__(self):
+        super().__init__('my_node')
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = MyNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+Two notes. Passing `args` through to `rclpy.init` is what makes `--ros-args -p name:=value` work on
+the command line, so keep it even with no arguments in mind. And the shutdown pair is normally *not*
+reached: `Ctrl+C` shuts the context down and also raises `KeyboardInterrupt` inside `spin`, which
+propagates out with a traceback, leaving the operating system to reclaim everything at exit. Those
+two lines matter when `spin` returns for any other reason, so write them anyway.
+
+## What a node is made of
+
+`create_publisher(msg_type, topic, qos_profile)` returns a publisher; call `.publish(msg)` on it. The
+third argument is [Chapter 1.2](./ros2-architecture.mdx)'s queue depth, `10` throughout this book.
+
+`create_subscription(msg_type, topic, callback, qos_profile)` registers a callback that `rclpy` calls
+with one message argument per arrival. Note the shape: nothing in your code reads the topic. You are
+handed messages.
+
+`create_timer(timer_period_sec, callback)` calls a no-argument callback every `timer_period_sec`
+seconds. A timer is how a node does anything on its own initiative — publishing a reading, checking
+a watchdog, emitting a status line.
+
+Keep whatever these return as an attribute on the node: the node owns and destroys them.
+
+Nodes carry a logger too, from `get_logger()`, offering `debug`, `info`, `warning`, `error`, and
+`fatal`. Prefer it to `print` — its output is tagged with the node's name and severity, and it goes
+onto the `/rosout` topic as well as the console.
+
+## Parameters: settings you can change without a restart
+
+Hard-coding `0.30` as a stopping threshold — [Chapter 1.2](./ros2-architecture.mdx)'s `STOP_GAP` — is
+fine until the floor is slippery, or a colleague wants the same node more cautious, or you are twenty
+runs into tuning and every change costs an edit and a restart. Constants are also invisible from
+outside: nothing can tell you what threshold a running node is actually using.
+
+A **parameter** is a named, typed configuration value that belongs to a node and can be read and
+written while it runs. [Chapter 1.2](./ros2-architecture.mdx) noted the six parameter services every
+node ships without your writing them; `ros2 param` is the client for those.
+
+`STOP_GAP` and `SLOW_GAP` are the two worth exposing: they describe the floor you are driving on.
+`CRUISE_SPEED` and `CREEP_SPEED` stay constants, because they describe the vehicle.
+
+Declare them in the constructor:
+
+```python
+self.declare_parameter('stop_gap', 0.30)
+```
+
+The type is inferred from the default value, so this one is a double and setting it to a string will
+be rejected. Read it with `self.get_parameter('stop_gap').value`, which returns the plain Python
+value.
+
+*Where* you read it decides what it is. Read it once in the constructor and you have a startup
+setting. Read it inside the callback, every time, and the node picks up changes immediately — one
+line of difference between a value fixed at launch and a dial you can turn on a running robot.
+
+## One thread, one callback at a time
+
+`rclpy.spin(node)` called without an executor argument uses the global
+[executor](https://docs.ros.org/en/jazzy/Concepts/Intermediate/About-Executors.html), which is a
+`SingleThreadedExecutor` — a class whose own docstring says it "runs callbacks in the thread that
+calls `spin`". There is one thread. It waits for something to become ready, runs the matching
+callback to completion, and only then looks for the next ready thing.
+
+The consequence: **while one callback is running, no other callback in that node can run.** Not the
+timer, not a second subscription, not a service you are offering. A callback that takes two seconds
+makes the node deaf and mute for two seconds.
+
+Three things happen during that stall.
+
+*Messages queue, then are discarded.* They accumulate in the subscription's queue, bounded by the
+depth you passed to `create_subscription` — `10` here. Past that the queue starts dropping. The node
+keeps working, on data that is now seconds old.
+
+*Timer ticks are skipped, not deferred.* An overdue ROS 2 timer does not fire once per missed period
+when the thread frees up. The underlying
+[`rcl` timer](https://github.com/ros2/rcl/blob/jazzy/rcl/src/rcl/timer.c) advances its next call time
+by whole periods until that time is in the future, so a 1 Hz timer blocked for two seconds fires
+once, not twice. The missed beat is gone.
+
+*Nobody is told.* No exception, no warning. The node is running, its topics are listed, and it is
+merely slow — the hardest failure to notice, and the reason this section exists.
+
+So: **a callback must return quickly.** Arithmetic, a comparison, a lookup, a `publish` — anything
+bounded and fast. Never a `sleep`, a blocking network request, or a long model inference. When you
+genuinely need slow work inside a node, the ROS 2 answer is a `MultiThreadedExecutor` together with
+callback groups declaring which callbacks may overlap. Those exist and are the right tool; they are
+also beyond this chapter. What you need now is to recognise the symptom.
+
+## Where the agent goes
+
+This chapter's node is an *agent node*, and the useful part of that phrase is architectural. The
+deciding is not ROS 2's business. Write it as a plain Python function — measurements in, a command
+out, no `rclpy` anywhere near it — and let the node be a thin adapter that unpacks messages, calls
+it, and packs the answer back into a message.
+
+That separation is why this skeleton survives the rest of the book. Today the function is four lines
+of thresholds; later it is a planner, a policy network, or a language model turning a sentence into a
+command. The node around it does not change, and the function stays testable in ordinary Python. The
+only rule it inherits is the one above: it must return fast enough for the callback that calls it.
+
+## Example 1: the pilot, completed
+
+This is [Chapter 1.2](./ros2-architecture.mdx)'s `pilot.py`, finished. It subscribes to `/gap`,
+chooses a speed, and publishes that speed on `/cmd_speed`: sense arrives from another process, think
+happens in `choose_speed`, act leaves as a message. It also declares two parameters and runs a status
+timer, so there are two callbacks competing for one thread — which is what Example 2 is about.
+
+**Environment.** ROS 2 **Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**, `rclpy`, and the message type
+`example_interfaces/msg/Float64`; the install and sourcing steps are
+[Chapter 1.2](./ros2-architecture.mdx)'s, unchanged. You also need that chapter's `range_sensor.py`
+to publish the `/gap` stream. No simulator or robot is involved.
+
+Save this as `pilot.py`, replacing [Chapter 1.2](./ros2-architecture.mdx)'s version — the callbacks
+are renamed for what triggers them, and the logged decision word becomes the number it publishes, so
+keep the old file if you have not done that chapter's exercises yet:
+
+```python
+"""Subscribes to the measured gap, decides a speed, and publishes it."""
+
+import rclpy
+from rclpy.node import Node
+
+from example_interfaces.msg import Float64
+
+CRUISE_SPEED = 1.00   # m/s: speed when the wall is comfortably far away
+CREEP_SPEED = 0.30    # m/s: speed when closing in
+
+
+def choose_speed(gap, stop_gap, slow_gap):
+    """Plain Python: a measurement in, a command out. No ROS 2 in here."""
+    if gap <= stop_gap:
+        return 0.0
+    if gap <= slow_gap:
+        return CREEP_SPEED
+    return CRUISE_SPEED
+
+
+class Pilot(Node):
+
+    def __init__(self):
+        super().__init__('pilot')
+
+        self.declare_parameter('stop_gap', 0.30)
+        self.declare_parameter('slow_gap', 0.50)
+
+        self.command_pub = self.create_publisher(Float64, 'cmd_speed', 10)
+        self.gap_sub = self.create_subscription(
+            Float64, 'gap', self.on_gap, 10)
+        self.status_timer = self.create_timer(1.0, self.on_status)
+
+        self.readings = 0
+        self.last_speed = 0.0
+
+        self.get_logger().info('pilot ready, waiting for /gap')
+
+    def on_gap(self, msg):
+        stop_gap = self.get_parameter('stop_gap').value
+        slow_gap = self.get_parameter('slow_gap').value
+
+        speed = choose_speed(msg.data, stop_gap, slow_gap)
+
+        command = Float64()
+        command.data = speed
+        self.command_pub.publish(command)
+
+        self.readings += 1
+        self.last_speed = speed
+        self.get_logger().info(
+            'gap %.2f m -> speed %.2f m/s' % (msg.data, speed))
+
+    def on_status(self):
+        self.get_logger().info(
+            'status: %d readings, last command %.2f m/s'
+            % (self.readings, self.last_speed))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    pilot = Pilot()
+    rclpy.spin(pilot)
+    pilot.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+Start the sensor in one terminal and the pilot in another:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+python3 range_sensor.py
+```
+
+```bash
+source /opt/ros/jazzy/setup.bash
+python3 pilot.py
+```
+
+The sensor drops the gap by 2 cm every half second, so the pilot logs twice a second and the status
+timer once a second. Timestamps are wall-clock, so yours will differ:
+
+```text
+[INFO] [1749826123.108374512] [pilot]: pilot ready, waiting for /gap
+[INFO] [1749826123.514226803] [pilot]: gap 0.54 m -> speed 1.00 m/s
+[INFO] [1749826124.014189347] [pilot]: gap 0.52 m -> speed 1.00 m/s
+[INFO] [1749826124.108551096] [pilot]: status: 2 readings, last command 1.00 m/s
+[INFO] [1749826124.514173925] [pilot]: gap 0.50 m -> speed 0.30 m/s
+[INFO] [1749826125.014162580] [pilot]: gap 0.48 m -> speed 0.30 m/s
+[INFO] [1749826125.108539674] [pilot]: status: 4 readings, last command 0.30 m/s
+```
+
+Two callbacks, interleaved by one thread, and each status line counts exactly the readings that
+preceded it — two per second, against a 1 Hz timer.
+
+The commands really are leaving the node. In a third terminal:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+ros2 topic echo /cmd_speed
+```
+
+Wait for the sweep to reach the stopping threshold and the decision changes, one message per
+reading. These three are the commands for gaps of 0.32, 0.30, and 0.28 m:
+
+```text
+data: 0.3
+---
+data: 0.0
+---
+data: 0.0
+---
+```
+
+### Retuning it while it runs
+
+Stop the `echo` and ask the pilot what settings it has:
+
+```bash
+ros2 param list /pilot
+```
+
+```text
+  slow_gap
+  stop_gap
+  use_sim_time
+```
+
+Two you declared; `use_sim_time` is on every ROS 2 node. Read one, and the type comes back with it:
+
+```bash
+ros2 param get /pilot slow_gap
+```
+
+```text
+Double value is: 0.5
+```
+
+Now make the pilot far more cautious, without touching the file or restarting anything:
+
+```bash
+ros2 param set /pilot slow_gap 0.9
+```
+
+```text
+Set parameter successful
+```
+
+Its next log line has already changed behaviour: it creeps at gaps it was cruising through a moment
+ago. The sweep has wrapped back to the top of its range here and is descending again.
+
+```text
+[INFO] [1749826136.014191238] [pilot]: gap 0.86 m -> speed 0.30 m/s
+[INFO] [1749826136.108562417] [pilot]: status: 26 readings, last command 0.30 m/s
+[INFO] [1749826136.514205774] [pilot]: gap 0.84 m -> speed 0.30 m/s
+```
+
+That took effect on the very next message because `on_gap` calls `get_parameter` every time it runs.
+Had the constructor cached the value in `self.slow_gap`, the `set` would have succeeded and changed
+nothing observable — a genuinely confusing bug, worth recognising now. Stop both nodes with `Ctrl+C`.
+
+## Example 2: what a blocking callback does
+
+Now break it on purpose, because this failure is invisible until you have seen it once.
+
+This node subscribes to the same `/gap` stream and runs a 1 Hz heartbeat timer, but its message
+callback sleeps for `think_seconds` first. The `sleep` stands in for the real slow work you will be
+tempted to put there — a model inference, an HTTP call to a planner, a large file read.
+
+**Environment.** Exactly as Example 1 — ROS 2 **Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**, `rclpy`,
+`example_interfaces`, and `range_sensor.py` running to supply `/gap`. Nothing further to install.
+
+Save this as `blocking_agent.py`:
+
+```python
+"""Demonstrates what a slow callback does to the node around it."""
+
+import time
+
+import rclpy
+from rclpy.node import Node
+
+from example_interfaces.msg import Float64
+
+
+class BlockingAgent(Node):
+
+    def __init__(self):
+        super().__init__('blocking_agent')
+
+        self.declare_parameter('think_seconds', 2.0)
+
+        self.gap_sub = self.create_subscription(
+            Float64, 'gap', self.on_gap, 10)
+        self.heartbeat_timer = self.create_timer(1.0, self.on_heartbeat)
+
+        self.beats = 0
+
+    def on_gap(self, msg):
+        think_seconds = self.get_parameter('think_seconds').value
+        self.get_logger().info('start: gap %.2f m' % msg.data)
+        time.sleep(think_seconds)
+        self.get_logger().info('done: gap %.2f m' % msg.data)
+
+    def on_heartbeat(self):
+        self.beats += 1
+        self.get_logger().info('heartbeat %d' % self.beats)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    agent = BlockingAgent()
+    rclpy.spin(agent)
+    agent.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+With `range_sensor.py` running, start it in another terminal:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+python3 blocking_agent.py
+```
+
+```text
+[INFO] [1749826310.514382109] [blocking_agent]: start: gap 0.80 m
+[INFO] [1749826312.514601733] [blocking_agent]: done: gap 0.80 m
+[INFO] [1749826312.514774218] [blocking_agent]: heartbeat 1
+[INFO] [1749826312.514901556] [blocking_agent]: start: gap 0.78 m
+[INFO] [1749826314.515118904] [blocking_agent]: done: gap 0.78 m
+[INFO] [1749826314.515287340] [blocking_agent]: heartbeat 2
+[INFO] [1749826314.515412677] [blocking_agent]: start: gap 0.76 m
+[INFO] [1749826316.515630021] [blocking_agent]: done: gap 0.76 m
+[INFO] [1749826316.515798466] [blocking_agent]: heartbeat 3
+[INFO] [1749826316.515925803] [blocking_agent]: start: gap 0.74 m
+```
+
+Read the timestamps, not the words. The heartbeat timer is set to 1.0 seconds and its beats are two
+seconds apart: the intervening ticks were skipped, not queued. Nothing overlaps — every heartbeat
+sits in the sliver between one gap callback ending and the next beginning, because one thread cannot
+be inside two callbacks at once.
+
+The gap values are worse. The sensor still publishes every half second, so the 0.74 m reading picked
+up at the end was measured four and a half seconds before the node began thinking about it, by which
+point the real gap is 0.56 m — and four readings arrive for every one processed, so the backlog
+grows until the ten-deep queue starts discarding. That is
+[Chapter 1.1](./physical-ai-embodied-intelligence.mdx)'s latency-is-correctness point arriving as the
+one thing you never get: an error. The node reports none. It decides about a world that has moved on.
+
+Now run it with the thinking removed:
+
+```bash
+python3 blocking_agent.py --ros-args -p think_seconds:=0.0
+```
+
+Heartbeats return to one second apart and gap callbacks to two per second, each pair's start and end
+timestamps identical to the millisecond. Same code, same executor; the only change is how long a
+callback held the thread.
+
+## Exercises
+
+Each needs ROS 2 Jazzy on Ubuntu 24.04, plus `range_sensor.py` from
+[Chapter 1.2](./ros2-architecture.mdx) and the two files above.
+
+**1. Retune a running node.** With the sensor and `pilot.py` running, raise `stop_gap` to `0.70` with
+`ros2 param set`, read it back with `ros2 param get`, and watch `/cmd_speed` with `ros2 topic echo`
+throughout. Then try `ros2 param set /pilot stop_gap fast`.
+*Correct result*: `Set parameter successful`, then `Double value is: 0.7`, and as soon as the gap
+next falls to 0.70 m or below, the published command is `0.0` where it had been `1.0`. Note that
+`0.3` disappears from the stream entirely — say why, given that `stop_gap` is now above `slow_gap`.
+The second `set` fails; explain that from how the parameter was declared.
+
+**2. Write a node from a blank file.** Without copying `pilot.py`, write `speed_watch.py`: a node
+named `speed_watch` subscribing to `/cmd_speed`, counting commands seen and how many were `0.0`,
+publishing nothing, and logging both counts from a two-second timer.
+*Correct result*: three nodes in `ros2 node list`; `ros2 topic info /cmd_speed` reporting
+`Publisher count: 1` and `Subscription count: 1`; and each status line four commands ahead of the
+last, because the pilot publishes at the sensor's 2 Hz.
+
+**3. Stall the pilot, and measure it.** Add `import time` at the top of `pilot.py` and
+`time.sleep(0.6)` as the first line of `on_gap`, then run `ros2 topic hz /cmd_speed` before and
+after — `hz` subscribes to a topic and reports the rate at which it is being published.
+*Correct result*: `average rate` about `2.000` before and about `1.667` after — the callback now
+outlasts the 0.5 s between readings, so the node never catches up. Name which of the three
+consequences from "One thread, one callback at a time" you are watching, and say why `0.4` instead
+of `0.6` would have hidden it.
+
+**4. Separate thinking from plumbing.** Import `choose_speed` from `pilot.py` into a plain script —
+no `rclpy.init`, no node, no ROS 2 running — and call it with gaps of `0.80`, `0.50`, `0.30`, and
+`0.10` at `stop_gap=0.30` and `slow_gap=0.50`.
+*Correct result*: `1.0`, `0.3`, `0.0`, `0.0`, with the sensor stopped; the terminal still needs
+sourcing, because importing `pilot.py` imports `example_interfaces`. Say which threshold each
+boundary value landed on, and what that buys you when testing.
+
+You can now write, run, retune, and diagnose a node that both consumes and produces. What is missing
+is the robot: every gap here came from a number in a Python file, and every command went nowhere.
+Next you describe an actual body — links, joints, and geometry — in a form a simulator and a physics
+engine can read.
