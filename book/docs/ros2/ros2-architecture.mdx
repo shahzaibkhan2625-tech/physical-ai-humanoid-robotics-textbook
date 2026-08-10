@@ -1,0 +1,590 @@
+---
+sidebar_position: 3
+title: "ROS 2 Architecture: Nodes, Topics, Services"
+---
+
+# ROS 2 Architecture: Nodes, Topics, Services
+
+[Chapter 1.1](./physical-ai-embodied-intelligence.mdx) ended with a question it could not answer:
+once sense, think, and act are no longer three function calls in one Python file, how do they talk
+to each other? That they *must* be separate programs is settled there. This chapter is about the
+machinery that connects them, starting with what that machinery has to do.
+
+## Learning objectives
+
+By the end of this chapter you will be able to:
+
+- Describe what a node, a topic, and a service are, and what each one is for.
+- Choose between a topic and a service for a given need, and justify the choice.
+- Inspect a running ROS 2 system from the command line: which nodes exist, what they publish, what
+  data is flowing, and which services are on offer.
+
+## What the connection has to provide
+
+Take the wall-approaching robot from Chapter 1.1 and split it three ways: a sensor driver, a
+decision program, a motor driver. Three processes, no shared memory. Four requirements follow, and
+each is a way the naive version fails.
+
+- **Addressing without hard-coding.** The decision program needs range readings but must not know
+  the sensor is process 4471 on port 9002 — that changes every restart, and the sensor may not have
+  started yet.
+- **Producers that never block on consumers.** If a slow consumer can stall the sensor, one bad
+  program takes the robot down, and Chapter 1.1 showed that a loop missing its deadline is wrong
+  rather than late.
+- **One producer, many consumers.** A camera stream feeds obstacle detection, localization, and a
+  logger at once; wiring every pair point-to-point is *n²* connections and *n²* mistakes.
+- **Independent lifetimes.** Programs start, crash, and restart in any order, and a restarted one
+  must rejoin without anything else being reconfigured.
+
+ROS 2 provides these. It is not a framework you write your robot inside but a set of libraries and a
+wire protocol letting independent programs find each other and exchange typed data. Underneath sits
+DDS, an industrial publish–subscribe standard supplying discovery and transport, which is why nodes
+find each other with no central server running. Everything below targets **ROS 2 Jazzy Jalisco on
+Ubuntu 24.04 (Noble)**.
+
+## Nodes: the unit of computation
+
+A **node** is one participant in the system: a program that does one job and communicates about it.
+The [official guidance](https://docs.ros.org/en/jazzy/Tutorials/Beginner-CLI-Tools/Understanding-ROS2-Nodes/Understanding-ROS2-Nodes.html)
+is that each node is responsible for a single modular purpose — driving the wheel motors, or
+publishing data from a laser range-finder. A humanoid running this book's full stack will have
+dozens.
+
+A node is not a process: one executable can contain several, though here each contains exactly one,
+the common case in Python. What makes a node a node is that it registers with the ROS
+graph under a name — `/range_sensor`, `/pilot` — and everything else addresses it, and its data, by
+that name rather than by an address. That is the whole point: neither program references the other,
+so you can restart either or swap the simulated sensor for a real driver without editing a line
+anywhere else.
+
+## Topics: streaming data, many to many
+
+A **topic** is a named bus for a stream of messages. A node *publishes* to it; any number of nodes
+*subscribe* to it. Publishers do not know who is subscribed, subscribers do not know who is
+publishing, and either side can appear or vanish while the system runs.
+
+Topics are one-way and fire-and-forget. `publish()` hands the message to the middleware and returns:
+no reply, no acknowledgement your code can see, no way to tell whether anyone consumed it. That is
+exactly the property the sensor needed — a producer no consumer can stall. They are also
+many-to-many: one topic carries data from several publishers to several subscribers at once.
+
+Delivery behaviour is governed by **Quality of Service** settings — reliability, history depth,
+durability and more — and ROS 2 connects a publisher to a subscriber only when their profiles are
+compatible. In `rclpy` the visible part is one integer: the queue depth passed when you create a
+publisher or subscription, limiting how many messages are held when a subscriber falls behind. This
+book uses 10 everywhere and tunes QoS no further.
+
+## Discovery: how nodes find each other
+
+There is no ROS master in ROS 2: no single process's death takes the system down.
+
+Instead, a starting node advertises its presence to other nodes on the network sharing its **ROS
+domain**, set by the `ROS_DOMAIN_ID` environment variable. Those nodes respond with their own
+details; connections form wherever publisher and subscriber match on name, type, and compatible QoS;
+nodes keep advertising periodically so anything starting later is still found; and a node advertises
+its departure when it goes offline.
+
+Two consequences matter. Start order is irrelevant — a subscriber started first connects when the
+publisher appears. And `ROS_DOMAIN_ID` is an isolation boundary: two people on one network using the
+same domain ID will see each other's nodes, a genuinely confusing first bug.
+
+## Messages and interface types
+
+Nodes exchange **messages**, and every topic carries exactly one message type, defined in an
+interface file listing fields and their types. Both ends must agree: a publisher and a subscriber
+with mismatched types do not connect at all.
+
+Types are named `package/msg/TypeName` — `example_interfaces/msg/Float64`,
+`geometry_msgs/msg/Twist`. The package part matters, because it makes a type shared vocabulary
+rather than something each project invents: any node that speaks `sensor_msgs/msg/Range` can consume
+any range sensor's output. Services use the same system with a second file format,
+`package/srv/TypeName`, defining a request structure and a response structure separated by `---`.
+
+`ros2 interface show` prints any of these, as you will see below. Defining your own interface
+package is out of scope here.
+
+## Services: ask a question, get an answer
+
+Some interactions are not streams. "Are you calibrated?" and "load this map" are one-off exchanges
+where the caller needs a specific reply before continuing, and where repeating the request at 10 Hz
+would be absurd.
+
+A **service** is that pattern: a client sends a request to a named service, the server runs a
+callback and returns a response, and that request is matched to that one response. It is
+call-and-response rather than a data stream.
+
+Three differences from topics decide when you use it. A service has one server per name, so the
+many-to-many fan-out does not apply. The client waits for the response, so a slow server stalls its
+caller. And nothing happens unless somebody calls, which makes a service useless for anything you
+need continuously.
+
+Nearly every ROS 2 node also offers built-in services you did not write, under its own name — six
+for parameters and, since Jazzy, one more — which is why the service listing below is longer than
+you would expect.
+
+## Choosing between them
+
+Here is a rule you can apply, in order:
+
+1. **Does the sender need a reply to do its job?** If no, use a topic. Sensor readings, joint
+   states, and velocity commands are one-way announcements: publish and move on.
+2. **Is the data produced continuously, whether or not anyone wants it?** Then it is a topic
+   regardless of (1). A sensor that only speaks when asked stalls when the asker is busy.
+3. **Is it a one-off that changes state or answers a specific question, where the caller cannot
+   continue without the answer?** That is a service — loading a map, enabling motion, reading a
+   configuration value.
+4. **Would more than one program need to serve it?** Only one node can own a service name, so if
+   yes, you want a topic.
+5. **Will the work take seconds, and does the caller want progress or the ability to change its
+   mind?** Neither fits: a service leaves the client blocked with no visibility, a topic gives no
+   completion signal.
+
+Case (5) is common — "walk to the kitchen" is exactly it — and ROS 2 has a third primitive,
+**actions** (the ROS 2 mechanism, not Chapter 1.1's sense of the word), for long-running goals that
+report feedback and can be cancelled. This book introduces ROS 2 actions where the navigation stack
+needs them, once there is a goal worth cancelling. In the other direction, services are easy to
+overuse: the ROS 2 documentation's own
+[rule of thumb](https://docs.ros.org/en/jazzy/Tutorials/Beginner-CLI-Tools/Understanding-ROS2-Services/Understanding-ROS2-Services.html)
+is that you generally do not want one for continuous calls, so if you are calling a service in a
+loop, you wanted a topic.
+
+## Example 1: a talker and a listener over a topic
+
+This is [Chapter 1.1](./physical-ai-embodied-intelligence.mdx)'s robot, cut in half: one node plays
+the range sensor and publishes the measured gap to the wall, a second subscribes to that gap and
+makes the same cruise/creep/stop decision the `think` function made there. Neither program mentions
+the other. The pair is the sense-and-think half only: the pilot's decision goes nowhere, the motor
+driver comes later, and the sweep is noise-free because the subject here is transport, not
+estimation.
+
+**Environment.** ROS 2 **Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**. Both files use `rclpy` and the
+message type `example_interfaces/msg/Float64`. `example_interfaces` is pulled in by
+`ros-jazzy-desktop`; if you installed `ros-jazzy-ros-base`, add it with
+`sudo apt install ros-jazzy-example-interfaces`. Every terminal below must first run
+`source /opt/ros/jazzy/setup.bash`. No simulator or robot is needed, and both programs are plain
+Python scripts run with `python3` — no package or build step.
+
+Save this as `range_sensor.py`:
+
+```python
+"""Publishes a simulated range reading: the gap to a wall, in metres."""
+
+import rclpy
+from rclpy.node import Node
+
+from example_interfaces.msg import Float64
+
+START_CM = 100   # gap the sweep starts from
+STEP_CM = 2      # how much the gap shrinks per reading
+MIN_CM = 20      # gap at which the sweep restarts
+
+
+class RangeSensor(Node):
+
+    def __init__(self):
+        super().__init__('range_sensor')
+        self.publisher_ = self.create_publisher(Float64, 'gap', 10)
+        self.timer = self.create_timer(0.5, self.timer_callback)
+        self.gap_cm = START_CM
+
+    def timer_callback(self):
+        msg = Float64()
+        msg.data = self.gap_cm / 100.0
+        self.publisher_.publish(msg)
+        self.get_logger().info('published gap %.2f m' % msg.data)
+        self.gap_cm -= STEP_CM
+        if self.gap_cm < MIN_CM:
+            self.gap_cm = START_CM
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    range_sensor = RangeSensor()
+    rclpy.spin(range_sensor)
+    range_sensor.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+`create_publisher(Float64, 'gap', 10)` declares `Float64` messages on a topic named `gap` with a
+queue depth of 10. That name is relative, so it resolves to `/gap` — hence the leading slash in the
+command-line output. `create_timer(0.5, ...)` asks ROS 2 to call `timer_callback` twice a second,
+and `rclpy.spin()` hands the thread over so callbacks can run.
+
+Save this as `pilot.py`:
+
+```python
+"""Subscribes to the measured gap and decides how fast to drive."""
+
+import rclpy
+from rclpy.node import Node
+
+from example_interfaces.msg import Float64
+
+STOP_GAP = 0.30   # m: stop at or below this measured gap
+SLOW_GAP = 0.50   # m: creep at or below this measured gap
+
+
+class Pilot(Node):
+
+    def __init__(self):
+        super().__init__('pilot')
+        self.subscription = self.create_subscription(
+            Float64,
+            'gap',
+            self.gap_callback,
+            10)
+
+    def gap_callback(self, msg):
+        if msg.data <= STOP_GAP:
+            decision = 'STOP'
+        elif msg.data <= SLOW_GAP:
+            decision = 'CREEP'
+        else:
+            decision = 'CRUISE'
+        self.get_logger().info('gap %.2f m -> %s' % (msg.data, decision))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    pilot = Pilot()
+    rclpy.spin(pilot)
+    pilot.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+Run the sensor in one terminal:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+python3 range_sensor.py
+```
+
+It logs every half second. ROS 2's default console format is
+`[{severity}] [{time}] [{name}]: {message}`; the timestamp is wall-clock, so yours will differ:
+
+```text
+[INFO] [1749825600.512438201] [range_sensor]: published gap 1.00 m
+[INFO] [1749825601.011927365] [range_sensor]: published gap 0.98 m
+[INFO] [1749825601.511884120] [range_sensor]: published gap 0.96 m
+[INFO] [1749825602.011903774] [range_sensor]: published gap 0.94 m
+```
+
+Now start the pilot in a second terminal, again after sourcing:
+
+```bash
+python3 pilot.py
+```
+
+It picks up the stream wherever the sensor happens to be — the discovery model showing its face,
+with no required start order:
+
+```text
+[INFO] [1749825607.512004811] [pilot]: gap 0.72 m -> CRUISE
+[INFO] [1749825608.011962093] [pilot]: gap 0.70 m -> CRUISE
+[INFO] [1749825608.511948870] [pilot]: gap 0.68 m -> CRUISE
+```
+
+### Inspecting it from the command line
+
+Leave both running and open a third terminal. This is how you diagnose a robot doing nothing for no
+apparent reason.
+
+Which nodes exist:
+
+```bash
+ros2 node list
+```
+
+```text
+/pilot
+/range_sensor
+```
+
+What topics exist, and of what type:
+
+```bash
+ros2 topic list -t
+```
+
+```text
+/gap [example_interfaces/msg/Float64]
+/parameter_events [rcl_interfaces/msg/ParameterEvent]
+/rosout [rcl_interfaces/msg/Log]
+```
+
+`/parameter_events` and `/rosout` exist in every ROS 2 system; `/gap` is yours. Who is on it:
+
+```bash
+ros2 topic info /gap
+```
+
+```text
+Type: example_interfaces/msg/Float64
+Publisher count: 1
+Subscription count: 1
+```
+
+What the data looks like — `echo` subscribes and prints each message as YAML, `---` between
+messages:
+
+```bash
+ros2 topic echo /gap
+```
+
+```text
+data: 0.86
+---
+data: 0.84
+---
+data: 0.82
+---
+```
+
+While `echo` is still running, run `ros2 topic info /gap` again from a fourth terminal: the
+subscription count is now 2. You attached a second consumer to a live stream and neither the
+publisher nor the pilot noticed — the many-to-many property, and why inspecting a running robot is
+safe.
+
+Finally, the type itself:
+
+```bash
+ros2 interface show example_interfaces/msg/Float64
+```
+
+```text
+# This is an example message of using a primitive datatype, float64.
+# If you want to test with this that's fine, but if you are deploying
+# it into a system you should create a semantically meaningful message type.
+# If you want to embed it in another message, use the primitive data type instead.
+float64 data
+```
+
+That comment is the interface-type lesson in one place: `Float64` carries a number with no units,
+no timestamp, no statement of what it measures.
+Real drivers publish richer types — `sensor_msgs/msg/Range` for a range finder — so that meaning
+travels with the data. Stop both nodes with `Ctrl+C`.
+
+## Example 2: a service client and server
+
+Enabling motion is the other kind of interaction: it happens once and the caller needs to know it
+worked. Rule (3) from the decision list.
+
+**Environment.** As above — ROS 2 **Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**, `rclpy`, each
+terminal sourced with `source /opt/ros/jazzy/setup.bash`. The service type `std_srvs/srv/SetBool`
+ships with any ROS 2 distribution, so this example needs nothing extra.
+
+Save this as `motion_gate.py`:
+
+```python
+"""Offers a service that enables or disables the robot's motion."""
+
+import rclpy
+from rclpy.node import Node
+
+from std_srvs.srv import SetBool
+
+
+class MotionGate(Node):
+
+    def __init__(self):
+        super().__init__('motion_gate')
+        self.motion_enabled = False
+        self.srv = self.create_service(
+            SetBool, 'enable_motion', self.enable_motion_callback)
+        self.get_logger().info('motion gate ready, motion is disabled')
+
+    def enable_motion_callback(self, request, response):
+        self.motion_enabled = request.data
+        response.success = True
+        response.message = 'motion enabled' if request.data else 'motion disabled'
+        self.get_logger().info('request data=%s -> %s' % (request.data, response.message))
+        return response
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    motion_gate = MotionGate()
+    rclpy.spin(motion_gate)
+    motion_gate.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+The callback receives a `request` and a pre-made `response`, fills it in, and returns it; that
+return value reaches the client.
+
+Save this as `enable_motion_client.py`. With no arguments it enables motion; with `--disable` it
+turns it off:
+
+```python
+"""Calls the enable_motion service once and reports the response."""
+
+import sys
+
+import rclpy
+
+from std_srvs.srv import SetBool
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = rclpy.create_node('enable_motion_client')
+    client = node.create_client(SetBool, 'enable_motion')
+
+    request = SetBool.Request()
+    request.data = '--disable' not in sys.argv
+
+    while not client.wait_for_service(timeout_sec=1.0):
+        node.get_logger().info('service not available, waiting again...')
+
+    future = client.call_async(request)
+    rclpy.spin_until_future_complete(node, future)
+
+    response = future.result()
+    node.get_logger().info(
+        'requested %s -> success=%s, message="%s"'
+        % (request.data, response.success, response.message))
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+Three lines carry the pattern. `wait_for_service` blocks until a server for that name exists, which
+is how a client copes with starting first. `call_async` sends the request and returns a future
+immediately. `spin_until_future_complete` runs the node until that future has a result — the client
+waiting, made explicit.
+
+Start the server in one terminal:
+
+```bash
+python3 motion_gate.py
+```
+
+```text
+[INFO] [1749825900.204118773] [motion_gate]: motion gate ready, motion is disabled
+```
+
+Then, in a second terminal:
+
+```bash
+python3 enable_motion_client.py
+```
+
+```text
+[INFO] [1749825903.882014655] [enable_motion_client]: requested True -> success=True, message="motion enabled"
+```
+
+The client exits; the server logs the request and keeps running:
+
+```text
+[INFO] [1749825903.881662104] [motion_gate]: request data=True -> motion enabled
+```
+
+### Inspecting it from the command line
+
+With the server still running, in a third terminal:
+
+```bash
+ros2 service list
+```
+
+```text
+/enable_motion
+/motion_gate/describe_parameters
+/motion_gate/get_parameter_types
+/motion_gate/get_parameters
+/motion_gate/get_type_description
+/motion_gate/list_parameters
+/motion_gate/set_parameters
+/motion_gate/set_parameters_atomically
+```
+
+One service you wrote, seven inherited: the six parameter services, plus the
+`get_type_description` service that Jazzy added. Ask what type yours is, then what that type
+contains:
+
+```bash
+ros2 service type /enable_motion
+```
+
+```text
+std_srvs/srv/SetBool
+```
+
+```bash
+ros2 interface show std_srvs/srv/SetBool
+```
+
+```text
+bool data # e.g. for hardware enabling / disabling
+---
+bool success   # indicate successful run of triggered service
+string message # informational, e.g. for error messages
+```
+
+The `---` splits request from response: above it is what a client sends, below is what it gets back.
+Knowing that, you can call the service without writing a client at all — arguments are YAML:
+
+```bash
+ros2 service call /enable_motion std_srvs/srv/SetBool "{data: false}"
+```
+
+```text
+requester: making request: std_srvs.srv.SetBool_Request(data=False)
+
+response:
+std_srvs.srv.SetBool_Response(success=True, message='motion disabled')
+```
+
+That command is the service equivalent of `ros2 topic echo`, and the fastest way to test a server
+before any client code exists. `ros2 service info /enable_motion` reports the type along with how
+many clients and servers are attached. Stop the server with `Ctrl+C`.
+
+## Exercises
+
+Each needs a working ROS 2 Jazzy installation on Ubuntu 24.04 and the four files above.
+
+**1. Add a second listener.** Copy `pilot.py` to `logger.py`, rename the node to `logger`, and log
+only the raw value. Run it alongside the sensor and the pilot, then kill and restart the sensor
+while both listeners keep running.
+*Correct result*: three nodes in `ros2 node list`, `Subscription count: 2` from
+`ros2 topic info /gap`, both listeners logging the same values at once, and across the restart they
+go quiet and resume unaided — name the property of the discovery model that demonstrates.
+
+**2. Break the contract, and read the silence.** In `pilot.py` only, change the topic name from
+`'gap'` to `'range'` and run both nodes. Then restore it and instead change the message type to
+`example_interfaces/msg/Float32`.
+*Correct result*: both times the programs start cleanly, report no error, and the pilot logs
+nothing. Use `ros2 topic list` for the first case and `ros2 topic info` for the second, and record
+what each told you that the program output did not.
+
+**3. Publish from the command line.** Stop `range_sensor.py`, leave `pilot.py` running, and drive
+the pilot with `ros2 topic pub`. Use `ros2 interface show` for the field name; the value is YAML.
+Note that `ros2 topic pub` repeats at 1 Hz until `Ctrl+C`, and `--once` sends a single message.
+*Correct result*: one logged decision per message, and three values that make it print `STOP`,
+`CREEP` and `CRUISE`.
+
+**4. Justify the choice.** Topic or service, one sentence each naming the rule that settled it:
+(a) a battery voltage reading; (b) "return the current firmware version"; (c) an IMU stream at
+200 Hz; (d) "clear the stored map"; (e) "pick up the mug on the table and put it in the sink".
+*Correct result*: (a) and (c) are topics, (b) and (d) services, and (e) the case neither primitive
+handles — say why, in terms of duration, feedback, and cancellation.
+
+You can now read a ROS 2 system: what is running, what it is saying, how to ask it a question. What
+you have not done is write a node that both consumes and produces — the shape every decision-making
+program in this book takes. That is next.
