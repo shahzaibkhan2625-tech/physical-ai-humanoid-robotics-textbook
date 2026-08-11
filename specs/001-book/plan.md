@@ -13,10 +13,12 @@ The technical approach has three parts:
 1. **A fixed folder and ordering scheme** — one folder per module, ordering declared in
    `_category_.json` (modules) and `sidebar_position` (chapters and the introduction), never by
    filename sort.
-2. **A three-role authoring pipeline per chapter** — `chapter-writer` drafts using the
-   `chapter-authoring` skill; `code-verifier` and `consistency-checker` review independently in
-   fresh contexts; the writer applies fixes. Review is separated from authorship because an author
-   checking its own work reports itself green.
+2. **A three-role authoring pipeline, drafting per chapter and reviewing per module** —
+   `chapter-writer` drafts each chapter using the `chapter-authoring` skill; once every chapter in a
+   module is drafted, `code-verifier` and `consistency-checker` review the whole module
+   independently in fresh contexts; the writer applies fixes. Review is separated from authorship
+   because an author checking its own work reports itself green. It is batched per module because
+   running both reviewers on every chapter exhausts session usage limits (D4).
 3. **A two-stage definition of done** — `drafted` and `verified` — because this machine cannot
    execute ROS 2 code, and the constitution requires execution before a chapter is complete. The
    gap is made explicit and tracked rather than hidden.
@@ -133,23 +135,48 @@ so a chapter can be renamed without disturbing order and order can change withou
 `book/docs/intro.mdx` currently holds a placeholder. It is rewritten in place, keeping
 `slug: /` and `sidebar_position: 1` so the site root stays where it is and no links break.
 
-### D4 — Per-chapter authoring pipeline
+### D4 — Draft per chapter, review per module
 
-Every chapter runs the same four steps, in this order:
+**Per chapter** — two steps:
 
 1. **Draft** — `chapter-writer`, with the `chapter-authoring` skill preloaded. Reads the chapter's
    Catalog entry and the chapters before it; verifies claims against official docs; writes all
-   four parts.
-2. **Review, in parallel and independently** — `code-verifier` (syntax, real-vs-invented APIs,
-   Jazzy-vs-Lyrical idiom, environment/code agreement) and `consistency-checker` (chapter shape,
-   terminology, cross-links, forward references, single humanoid, scope). Neither can edit;
-   neither sees the writer's reasoning.
-3. **Apply fixes** — `chapter-writer` addresses every `blocker` and `major`. `minor` findings are
-   a judgement call and are recorded either way.
-4. **Re-review if any blocker was fixed** — a fix can introduce a new defect. Skipped only when
-   the first review returned no blockers.
+   four parts, and self-checks the draft against the skill's checklist before handing off.
+2. **Build green** — `npm run build` in `book/` passes with the new chapter in place. A chapter
+   that breaks the build is not handed on to the next chapter.
 
-Reviews run in parallel because they are independent; step 3 waits for both.
+**Per module**, once every chapter in that module is drafted — three steps:
+
+3. **Review, in parallel and independently, across the whole module** — `code-verifier` (syntax,
+   real-vs-invented APIs, Jazzy-vs-Lyrical idiom, environment/code agreement) and
+   `consistency-checker` (chapter shape, terminology, cross-links, forward references, single
+   humanoid, scope). Neither can edit; neither sees the writer's reasoning. Both receive every
+   chapter in the module, not one.
+4. **Apply fixes** — `chapter-writer` addresses every `blocker` and `major` across the module.
+   `minor` findings are a judgement call and are recorded either way.
+5. **Re-review if any blocker was fixed** — a fix can introduce a new defect. Scoped to the
+   chapters that were changed. Skipped only when the first review returned no blockers.
+
+Reviews run in parallel with each other because they are independent; step 4 waits for both.
+
+**Why review is batched per module.** Running both reviewers after every single chapter exhausted
+session token/usage limits before a module could be finished. Batching cuts review invocations for
+a four-chapter module from eight to two. The *self-check against the `chapter-authoring` skill*
+moves into the drafting step so no chapter is left entirely unexamined between drafts.
+
+**What this does not change.** Every quality gate still runs, with identical criteria: both
+reviewers, every `blocker` and `major` fixed, re-review after blocker fixes, build green, the
+`drafted` / `verified` split in D5. Only *when* review runs changed — not *whether*.
+
+**The cost, stated plainly.** A defect introduced in chapter *N* can now propagate into chapters
+*N+1…* before any reviewer sees it, making the fix wider than it would have been. This is the
+accepted trade for finishing modules within session limits. Two things contain it: the writer's
+self-check at draft time, and drafting chapters in catalog order so a later chapter builds on an
+already self-checked one.
+
+**Exception — Module 1.** Module 1 (Chapters 1.1–1.4, including 1.4) was already reviewed
+per chapter under the previous model and keeps that history; it is not re-reviewed as a module.
+The per-module model starts at Module 2.
 
 ### D5 — The ROS-code execution gap
 

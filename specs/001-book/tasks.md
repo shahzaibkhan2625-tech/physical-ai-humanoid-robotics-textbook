@@ -21,17 +21,31 @@ Module 2 (P2) starts (plan D7).
 - **[Story]**: US1–US4, mapping to the spec's user stories
 - Every task names its exact file path
 
-## The per-chapter loop
+## The authoring loop — draft per chapter, review per module
 
-Every chapter task expands into the same four steps (plan D4, quickstart Steps 1–4):
+Drafting is per chapter; review is batched once per module (plan D4). Reason: running both
+reviewers after every chapter exhausted session token/usage limits. Every gate still runs with
+identical criteria — only *when* review runs changed, not *whether*.
 
-1. **Draft** — `chapter-writer` (has `chapter-authoring` preloaded), one chapter only
-2. **Review** — `code-verifier` **and** `consistency-checker`, launched together, fresh context, neither can edit
-3. **Fix** — `chapter-writer` resolves every `blocker` and `major`; `minor` is a judgement call, recorded either way
-4. **Re-review** — only if a blocker was fixed
+**Every chapter task** expands into two steps:
 
-A chapter reaching the end of this loop is **`drafted`**, not done. It becomes **`verified`** only
-when every one of its examples has been executed (plan D5).
+1. **Draft** — `chapter-writer` (has `chapter-authoring` preloaded), one chapter only, self-checked
+   against the skill's checklist before handoff
+2. **Build green** — `npm run build` in `book/` passes with the new chapter in place
+
+**Every module has one review task**, run after all its chapters are drafted:
+
+3. **Review** — `code-verifier` **and** `consistency-checker`, launched together, fresh context,
+   neither can edit, both scoped to **every chapter in the module**
+4. **Fix** — `chapter-writer` resolves every `blocker` and `major`; `minor` is a judgement call,
+   recorded either way
+5. **Re-review** — only if a blocker was fixed; scoped to the changed chapters
+
+A module reaching the end of this loop is **`drafted`**, not done. Its chapters become
+**`verified`** only when every one of their examples has been executed (plan D5).
+
+**Module 1 is the exception**: Chapters 1.1–1.4 were reviewed per chapter under the previous model
+and keep that history. The per-module model applies from Module 2 onward.
 
 ## Path conventions
 
@@ -80,6 +94,11 @@ humanoid in URDF.
 **Independent Test**: Navigate intro → 1.1 → 1.2 → 1.3 → 1.4 in order; every chapter has all four
 parts; a reader with ROS 2 Jazzy can execute each example.
 
+**Review model — historical exception.** Every chapter in this phase, 1.4 included, ran
+`code-verifier` and `consistency-checker` **per chapter** under the previous model. That work
+stands; Module 1 is not re-reviewed as a module and has no module-review task. "Run the
+per-chapter loop" below records what was done. Modules 2–4 use the per-module model (plan D4).
+
 - [ ] T006 [US1] Scaffold `book/docs/ros2/` — create the folder and `_category_.json` with
       `{"label": "Module 1 — ROS 2: The Robotic Nervous System", "position": 2}`, plus
       `book/docs/ros2/index.mdx` (`sidebar_position: 1`) stating the module outcome and
@@ -121,16 +140,21 @@ publishing sensor topics, verified by inspecting those topics.
       `{"label": "Module 2 — Gazebo & Unity: The Digital Twin", "position": 3}`, and `index.mdx`
       (`sidebar_position: 1`) stating outcome and prerequisites (Module 1)
 - [ ] T014 [US2] Chapter 2.1 → `book/docs/digital-twin/gazebo-setup-and-basics.mdx`
-      (`sidebar_position: 2`). Run the per-chapter loop. Must spawn the **Chapter 1.4 humanoid** —
+      (`sidebar_position: 2`). **Draft + build green.** Must spawn the **Chapter 1.4 humanoid** —
       the book does not switch robots
 - [ ] T015 [US2] Chapter 2.2 → `book/docs/digital-twin/physics-gravity-collisions.mdx`
-      (`sidebar_position: 3`). Run the per-chapter loop. Explain *why* the biped falls; do not
+      (`sidebar_position: 3`). **Draft + build green.** Explain *why* the biped falls; do not
       solve balance control — the catalog lists it as out of scope
 - [ ] T016 [US2] Chapter 2.3 → `book/docs/digital-twin/simulating-sensors.mdx`
-      (`sidebar_position: 4`). Run the per-chapter loop. Sensor fusion belongs to Module 3
+      (`sidebar_position: 4`). **Draft + build green.** Sensor fusion belongs to Module 3
 - [ ] T017 [US2] Chapter 2.4 → `book/docs/digital-twin/unity-for-visualization.mdx`
-      (`sidebar_position: 5`). Run the per-chapter loop. Python side is the focus; C# only as far
+      (`sidebar_position: 5`). **Draft + build green.** Python side is the focus; C# only as far
       as needed to see it work
+- [ ] T017a [US2] **Module 2 review** — after T014–T017 are all drafted. Launch `code-verifier`
+      **and** `consistency-checker` together, fresh context, each scoped to all four Module 2
+      chapters plus `index.mdx`. Then `chapter-writer` applies every `blocker` and `major`;
+      `minor` is a judgement call, recorded either way. Re-review any chapter whose blocker was
+      fixed. Same gates as the old per-chapter review — only the batching changed (plan D4)
 - [ ] T018 [US2] Module 2 build + ordering check: `npm run build` in `book/`; confirm module order
       is intro → Module 1 → Module 2
 - [ ] T019 [US2] Reconcile `verification-log.md` for Module 2 examples
@@ -157,14 +181,20 @@ data, SLAM, and Nav2 each do; a reader with the hardware can run the examples.
       (`sidebar_position: 1`) stating outcome, prerequisites (Modules 1–2), **and the GPU
       requirement up front** (FR-019)
 - [ ] T022 [US3] Chapter 3.1 → `book/docs/isaac/isaac-sim-synthetic-data.mdx`
-      (`sidebar_position: 2`). Run the per-chapter loop. State the hardware requirement in the
+      (`sidebar_position: 2`). **Draft + build green.** State the hardware requirement in the
       opening; theory must stand alone without the GPU
 - [ ] T023 [US3] Chapter 3.2 → `book/docs/isaac/isaac-ros-visual-slam.mdx` (`sidebar_position: 3`).
-      Run the per-chapter loop. Must cover failure modes (featureless walls, motion blur, drift,
+      **Draft + build green.** Must cover failure modes (featureless walls, motion blur, drift,
       loop closure) — a reader who does not know these will misdiagnose every failure
 - [ ] T024 [US3] Chapter 3.3 → `book/docs/isaac/nav2-path-planning-for-bipeds.mdx`
-      (`sidebar_position: 4`). Run the per-chapter loop. **ROS 2 actions are introduced here** —
+      (`sidebar_position: 4`). **Draft + build green.** **ROS 2 actions are introduced here** —
       first place they have a real use. Must state what changes for a biped versus a wheeled base
+- [ ] T024a [US3] **Module 3 review** — after T022–T024 are all drafted. Launch `code-verifier`
+      **and** `consistency-checker` together, fresh context, each scoped to all three Module 3
+      chapters plus `index.mdx`. Then `chapter-writer` applies every `blocker` and `major`;
+      `minor` is a judgement call, recorded either way. Re-review any chapter whose blocker was
+      fixed. `code-verifier` carries extra weight here — Isaac examples that cannot be executed
+      (T020) have static review as their only check
 - [ ] T025 [US3] Module 3 build + ordering check: `npm run build` in `book/`
 - [ ] T026 [US3] Reconcile `verification-log.md` for Module 3. Any example needing a GPU that was
       not available is `blocked`, not `pending-env` — the distinction matters, because `blocked`
@@ -186,14 +216,20 @@ end-to-end through every layer the book taught.
       `{"label": "Module 4 — Vision-Language-Action (VLA)", "position": 5}`, and `index.mdx`
       (`sidebar_position: 1`) stating outcome and prerequisites (Modules 1–3)
 - [ ] T028 [US4] Chapter 4.1 → `book/docs/vla/voice-to-action-whisper.mdx`
-      (`sidebar_position: 2`). Run the per-chapter loop. Must explain why the command set is
+      (`sidebar_position: 2`). **Draft + build green.** Must explain why the command set is
       bounded — a robot acting on a misheard word is a safety problem, not a UX one
 - [ ] T029 [US4] Chapter 4.2 → `book/docs/vla/cognitive-planning-with-llms.mdx`
-      (`sidebar_position: 3`). Run the per-chapter loop. Must cover grounding and **plan validation
+      (`sidebar_position: 3`). **Draft + build green.** Must cover grounding and **plan validation
       before dispatch**
 - [ ] T030 [US4] Chapter 4.3 → `book/docs/vla/capstone-autonomous-humanoid.mdx`
-      (`sidebar_position: 4`). Run the per-chapter loop. **Introduces no new concepts** — every
+      (`sidebar_position: 4`). **Draft + build green.** **Introduces no new concepts** — every
       component must cite the chapter that taught it. Depends on all 13 preceding chapters
+- [ ] T030a [US4] **Module 4 review** — after T028–T030 are all drafted. Launch `code-verifier`
+      **and** `consistency-checker` together, fresh context, each scoped to all three Module 4
+      chapters plus `index.mdx`. Then `chapter-writer` applies every `blocker` and `major`;
+      `minor` is a judgement call, recorded either way. Re-review any chapter whose blocker was
+      fixed. `consistency-checker` must confirm the capstone cites the teaching chapter for every
+      component and introduces nothing new
 - [ ] T031 [US4] Module 4 build + ordering check: `npm run build` in `book/`; confirm all five
       sidebar entries in order
 - [ ] T032 [US4] Reconcile `verification-log.md` for Module 4
@@ -238,6 +274,10 @@ end-to-end through every layer the book taught.
 - **Phase 6 (US4)** — after Phase 5 checkpoint
 - **Phase 7 (Polish)** — after all four story phases
 
+Within Phases 4–6, the module review task (T017a / T024a / T030a) depends on **every** chapter task
+in its phase and **blocks that phase's checkpoint**. A module is not `drafted` until its review has
+run and its blockers and majors are fixed.
+
 ### Why the story phases are sequential here
 
 The spec's user stories are independently *testable*, but the chapters are not independently
@@ -257,10 +297,11 @@ follows plan D7 and spec priority; chapter order within a module follows the Cat
 
 ### Parallel opportunities — genuinely limited
 
-Real parallelism in this feature is **within** a chapter task, not across tasks:
+Real parallelism in this feature is **within** the module review task, not across tasks:
 
-- `code-verifier` and `consistency-checker` always run **together** on a drafted chapter. They are
-  independent of each other and of the writer; running them serially wastes the main win
+- `code-verifier` and `consistency-checker` always run **together** on a drafted module (T017a,
+  T024a, T030a). They are independent of each other and of the writer; running them serially
+  wastes the main win
 - T002 and T003 in Setup are independent of each other
 
 Everything else is sequential by content dependency. Marking chapter tasks `[P]` would be
@@ -272,18 +313,21 @@ them.
 
 ---
 
-## Parallel Example: any chapter task
+## Parallel Example: one module, drafted then reviewed
 
 ```text
-# Step 1 — draft (single agent)
-Task: "Use chapter-writer to draft Chapter 1.2 → book/docs/ros2/ros2-architecture.mdx"
+# Chapter tasks — one agent each, sequential, build green after each
+Task: "Use chapter-writer to draft Chapter 2.1 → book/docs/digital-twin/gazebo-setup-and-basics.mdx"
+Task: "Use chapter-writer to draft Chapter 2.2 → book/docs/digital-twin/physics-gravity-collisions.mdx"
+Task: "Use chapter-writer to draft Chapter 2.3 → book/docs/digital-twin/simulating-sensors.mdx"
+Task: "Use chapter-writer to draft Chapter 2.4 → book/docs/digital-twin/unity-for-visualization.mdx"
 
-# Step 2 — review, launched together in one message
-Task: "Use code-verifier on book/docs/ros2/ros2-architecture.mdx"
-Task: "Use consistency-checker on book/docs/ros2/ros2-architecture.mdx"
+# Module review task (T017a) — both reviewers launched together in one message
+Task: "Use code-verifier on all chapters in book/docs/digital-twin/"
+Task: "Use consistency-checker on all chapters in book/docs/digital-twin/"
 
-# Step 3 — fix (single agent, after both reports return)
-Task: "Use chapter-writer to apply the blocker and major findings"
+# Fix (single agent, after both reports return)
+Task: "Use chapter-writer to apply the blocker and major findings across Module 2"
 ```
 
 ---
@@ -301,20 +345,26 @@ Task: "Use chapter-writer to apply the blocker and major findings"
 Setup + Foundational → Module 1 (MVP) → Module 2 → Module 3 → Module 4 → Polish. Each module
 checkpoint is a demo point.
 
-### Two things that will bite if ignored
+### Three things that will bite if ignored
 
 1. **T020 before Module 3 drafting, not after.** Without GPU access, three chapters cannot reach
    `verified`. Discovering that after drafting wastes the drafting.
 2. **T037 is not optional polish.** Every chapter sits at `drafted` until its examples run. A book
    reported "complete" with unexecuted code violates Principle II — the honest status is
    "14 chapters drafted, N examples pending execution."
+3. **The module review task is not skippable, and deferring it costs more the later it runs.**
+   Batching review per module means a defect in chapter *N* can propagate into *N+1…* before any
+   reviewer sees it. Budget usage so the review task actually runs at the end of its module —
+   carrying it into the next module is how four unreviewed chapters become eight.
 
 ---
 
 ## Notes
 
-- 38 tasks: 3 setup, 2 foundational, 7 US1, 7 US2, 7 US3, 6 US4, 6 polish
+- 41 tasks: 3 setup, 2 foundational, 7 US1, 8 US2, 8 US3, 7 US4, 6 polish
 - 14 chapter tasks (T007–T010, T014–T017, T022–T024, T028–T030), one per catalog chapter
+- 3 module review tasks (T017a, T024a, T030a) — Modules 2, 3, 4. Module 1 has none: it was
+  reviewed per chapter under the previous model (plan D4 exception)
 - 4 module scaffolds (T006, T013, T021, T027), each bundling folder + `_category_.json` + landing page
 - 4 per-module build checks (T011, T018, T025, T031) plus baseline (T002), post-intro (T005), final (T038)
 - Commit after each task
