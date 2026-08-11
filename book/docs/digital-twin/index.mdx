@@ -1,0 +1,93 @@
+---
+sidebar_position: 1
+title: "Module 2 — Gazebo & Unity: The Digital Twin"
+---
+
+# Module 2 — Gazebo & Unity: The Digital Twin
+
+[Module 1](../ros2/index.mdx) ends with a robot that exists only as text. `simple_humanoid.urdf`
+says the pelvis weighs 4 kg and the knee bends 2.2 radians, and nothing has ever checked either
+claim against gravity. The `rclpy` nodes you wrote pushed numbers between processes; none of those
+numbers came from a body.
+
+This module gives the body a world. A physics engine takes the masses, the inertia tensors, and the
+collision shapes from that file completely literally, applies gravity and contact, and advances the
+result one small step at a time. What comes back is the first honest feedback the model has had —
+including the discovery that a robot which is legal URDF is not necessarily a robot that stands up.
+
+**The robot does not change.** Every chapter here loads the humanoid from
+[Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx) — the same thirteen links and twelve revolute
+joints, the same file. This module introduces no new robot, and none of the later modules do
+either. Where a chapter needs the robot to have something it lacks, it adds to that file rather
+than replacing it.
+
+## What this module covers
+
+**Gazebo Setup & Simulation Basics** installs the simulator, explains what a world is as opposed to
+a model, and spawns the humanoid into an empty world. Most of the chapter is about one thing that
+trips up everyone: Gazebo and ROS 2 are two separate messaging systems, and a bridge process has to
+translate between them. You finish by writing a Python node that proves, from the ROS 2 side, that
+the two are actually talking.
+
+**Physics, Gravity & Collisions** is about what the engine computes on each of those steps. Mass,
+centre of mass, and the inertia tensor; contact detection and friction; and the step size, which
+buys accuracy with wall-clock time. It is also where the humanoid falls over, and where you learn to
+read the fall as information about the model rather than as a bug in the simulator.
+
+**Simulating Sensors: LiDAR, Depth Cameras, IMU** hangs perception on the body. Each sensor is
+attached to a specific link, produces a specific ROS 2 message type in a specific frame, and lies in
+its own characteristic way. You add all three to the humanoid and read them from one Python node.
+Noise gets deliberate attention here: a perfectly clean simulated sensor teaches habits that fail on
+real hardware.
+
+**Unity for Robot Visualization** covers the second simulator and, more usefully, when not to reach
+for it. Unity renders far better than Gazebo and puts a scene in front of a human who is not a
+roboticist; it does not replace Gazebo's physics, and it costs an extra toolchain. You drive a Unity
+scene from ROS 2 data, with the Python side as the focus.
+
+## What you need first
+
+**Background.** All of [Module 1](../ros2/index.mdx). Specifically: topics, message types, and CLI
+inspection from [Chapter 1.2](../ros2/ros2-architecture.mdx); the node skeleton, callbacks, and
+parameters from [Chapter 1.3](../ros2/python-agents-rclpy.mdx); and the URDF model itself from
+[Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx). If you skipped Module 1, start there — this
+module explains none of it again.
+
+**Software.** The book targets one platform, and this module adds the simulator to it:
+
+| Component | Version |
+|---|---|
+| ROS 2 | Jazzy Jalisco |
+| Simulator | Gazebo Harmonic |
+| Operating system | Ubuntu 24.04 LTS (Noble Numbat) |
+| ROS ↔ Gazebo bridge | `ros-jazzy-ros-gz` (pulls in `ros_gz_sim`, `ros_gz_bridge`, `ros_gz_image`) |
+
+Gazebo Harmonic is the pairing officially supported alongside ROS 2 Jazzy, and both are long-term
+support releases whose windows run to May 2029, so the pair reaches end of life together. Chapter
+2.1 covers the install; the short version is one `apt` command, because as of Jazzy the ROS
+repository ships Gazebo itself as vendor packages.
+
+Gazebo Harmonic is not Gazebo Classic. The command is `gz sim`, not `gazebo` or `gzserver`, and the
+integration package is `ros_gz`, not `gazebo_ros`. A large amount of tutorial material online is for
+the previous generation and will not work here.
+
+**Hardware.** No robot and no GPU-accelerated AI hardware — but, plainly: **the Gazebo GUI needs
+Linux with working OpenGL drivers.** It renders through OGRE 2, and on a machine with no graphics
+acceleration — a bare virtual machine with software rendering, a container with no GPU passthrough,
+a remote shell with no display — the GUI will be unusably slow or will refuse to start. If that is
+your situation you can still run the simulation server headless with `gz sim -s` and inspect it
+entirely from the command line and from Python, which is how every verification step in this module
+is written; you simply will not see the robot. Unity's requirements in the last chapter are heavier
+still, and that chapter restates them.
+
+## What you will be able to do at the end
+
+- Launch a Gazebo Harmonic world containing this book's humanoid, and verify from a Python ROS 2
+  client that the simulator and ROS 2 are exchanging data.
+- Explain why a simulated biped falls over, and identify which physical property in the model
+  governs a given behaviour.
+- Attach a LiDAR, a depth camera, and an IMU to the robot, and read all three from one node.
+- Say when Unity is worth the extra toolchain and when Gazebo alone is enough.
+
+A reader who stops here has a robot that exists, moves under physics, and produces sensor data of
+the same shape a real robot's would. That data is what the next module's perception stack consumes.
