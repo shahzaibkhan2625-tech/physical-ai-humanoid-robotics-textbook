@@ -33,8 +33,9 @@ blocks stalls the whole node. The agent-node skeleton built here is reused for t
 book.
 
 **URDF: Describing a Humanoid** answers a question the first three chapters leave open: what is
-the robot, physically? You build a simple humanoid — torso, head, two arms, two legs — as links
-and joints, and learn why visual, collision, and inertial geometry are three different things.
+the robot, physically? You build a simple humanoid — pelvis, torso, head, two arms, and two legs
+with knees and feet — as links and joints, and learn why visual, collision, and inertial geometry
+are three different things.
 That model is the robot for every module that follows.
 
 ## What you need first
@@ -50,8 +51,10 @@ simulation, control theory, or hardware.
 | ROS 2 | Jazzy Jalisco |
 | Operating system | Ubuntu 24.04 LTS (Noble Numbat) |
 
-The first chapter is plain Python and runs anywhere Python 3 does. The remaining three need a
-working ROS 2 Jazzy installation on Ubuntu 24.04 — Jazzy's Tier 1 platform. On Windows or macOS,
+The first chapter is plain Python and runs anywhere Python 3 does, as do the fourth chapter's URDF
+and tree-walking script. The middle two chapters need a working ROS 2 Jazzy installation on
+Ubuntu 24.04 — Jazzy's Tier 1 platform — as does the fourth chapter's optional validation and
+visualization step. On Windows or macOS,
 use a virtual machine or a container running Ubuntu 24.04. Installation instructions are in the
 [ROS 2 Jazzy documentation](https://docs.ros.org/en/jazzy/Installation.html).
 

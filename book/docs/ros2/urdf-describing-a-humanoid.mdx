@@ -1,0 +1,919 @@
+---
+sidebar_position: 5
+title: "URDF: Describing a Humanoid"
+---
+
+# URDF: Describing a Humanoid
+
+Three chapters in, the robot is still an abstraction. [Chapter 1.3](./python-agents-rclpy.mdx)'s
+pilot publishes a speed to `/cmd_speed`, and nothing on the other end has a shape, a mass, or an
+arm. That is fine for transport, and stops being fine the moment something must draw the robot,
+work out whether it falls over, or ask whether its forearm reaches the shelf. Those are separate
+processes ([Chapter 1.2](./ros2-architecture.mdx)) that cannot ask your Python code and need the
+same facts about one body. So the body goes in a file.
+
+## Learning objectives
+
+By the end of this chapter you will be able to:
+
+- Read a URDF and describe the robot it defines: its links, its joints, and how they connect.
+- Extend this book's humanoid with a new link and joint, and check the result is still a valid tree.
+- Explain why collision geometry is normally simpler than visual geometry, and what this model
+  gives up by making them identical.
+
+## One description, three readers
+
+**URDF** — Unified Robot Description Format — is an XML format for a robot's *body*: which rigid
+pieces it is made of, how they connect, what each looks like, and how heavy it is.
+
+Three kinds of program read it. **Visualization** wants shapes and colours and where each piece is
+now, so a human can check it against their intention. **Physics** wants the opposite: mass,
+how it is distributed, and cheap shapes to test for contact thousands of times a second.
+**Kinematics** wants structure and offsets, to answer "given the twelve joint angles, where is the
+left forearm relative to the pelvis?" — the question `robot_state_publisher` answers continuously.
+
+Writing those facts once is what stops the three disagreeing: hard-code the upper-arm length in a
+renderer, a simulator and a planner, and within a month you have three arm lengths.
+
+## Links and joints
+
+A **link** is one rigid body: a piece that does not bend. A **joint** connects exactly two links —
+a *parent* and a *child* — and states how the child may move relative to the parent. That is the
+whole vocabulary.
+
+**Environment.** A URDF is a plain text file, needing only an editor. These fragments are excerpts
+from the complete file below, targeting **ROS 2 Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**; the
+tools that read it are named with their packages under *Validating and visualizing the model*.
+
+Here is the humanoid's pelvis, its root link:
+
+```xml
+<link name="base_link">
+  <visual>
+    <geometry>
+      <box size="0.20 0.26 0.14"/>
+    </geometry>
+    <material name="body_grey"/>
+  </visual>
+  <collision>
+    <geometry>
+      <box size="0.20 0.26 0.14"/>
+    </geometry>
+  </collision>
+  <inertial>
+    <mass value="4.0"/>
+    <inertia ixx="0.029067" ixy="0.0" ixz="0.0"
+             iyy="0.019867" iyz="0.0" izz="0.035867"/>
+  </inertial>
+</link>
+```
+
+A link has a name and up to three kinds of child block — `<visual>`, `<collision>`, `<inertial>`.
+Units are SI: a box 20 cm deep, 26 cm wide, 14 cm tall, 4 kg. Axes follow
+[REP 103](https://www.ros.org/reps/rep-0103.html): metres, kilograms, radians,
+**x forward, y left, z up**.
+
+The joint is where the interesting information lives:
+
+```xml
+<joint name="waist_joint" type="revolute">
+  <parent link="base_link"/>
+  <child link="torso"/>
+  <origin xyz="0 0 0.07" rpy="0 0 0"/>
+  <axis xyz="0 0 1"/>
+  <limit lower="-0.60" upper="0.60" effort="80.0" velocity="2.0"/>
+</joint>
+```
+
+Four things are declared at once, and only the first is obvious. `<parent>` and `<child>` give the
+connection, and the direction matters: the child hangs off the parent.
+
+`<origin>` is the fixed offset from the parent's frame to the child's frame with the joint at zero
+— 7 cm up, the top face of the pelvis box — with `rpy` a roll–pitch–yaw rotation in radians,
+`0 0 0` throughout this axis-aligned robot. **Every link's frame is defined by the joint above
+it**; `base_link` needs none, having no joint above it.
+
+`<axis>` is the direction the joint turns about, in the child's frame; `0 0 1` is z, so the waist
+twists.
+
+`<limit>` bounds it: 0.6 radians either way (about 34°), 80 N·m, 2 rad/s — not decoration, since a
+slider, a planner and a simulated motor all obey them.
+
+### The tree rule
+
+The connections must form a **tree**: one root link, every other the child of exactly one joint, no
+loops. So *n* links need exactly *n − 1* joints.
+
+That makes "where is this link?" answerable exactly once — walk from the root, multiplying each
+joint's **transform**, the position-and-rotation offset from one frame to the next. A loop — both
+hands on one steering wheel — would give two answers, so closed kinematic chains are out of scope
+here.
+
+The root's name is convention, but a strong one:
+[REP 120](https://www.ros.org/reps/rep-0120.html) calls it `base_link`, recommends the waist —
+where this model's is — and supplies the `l_` and `r_` prefixes.
+
+## The joint types that matter
+
+URDF defines six joint types. Every joint on this humanoid is `revolute`, and `fixed` is the other
+one you will meet constantly; the remaining four are worth recognising, not memorising.
+
+| Type | Motion | Typical use |
+|---|---|---|
+| `revolute` | rotates about `<axis>`, bounded | every joint here: hips, knees, elbows |
+| `continuous` | rotates about `<axis>`, unbounded | a wheel |
+| `prismatic` | slides along `<axis>`, bounded | a linear actuator |
+| `fixed` | none — a weld | mounting a sensor to a body |
+| `floating` | all six degrees of freedom | rare |
+| `planar` | translation in a plane plus rotation | rare |
+
+`fixed` moves nothing but adds a *frame* — what a camera or an IMU reports its data in.
+
+Two details bite beginners, both from
+[`urdfdom`](https://github.com/ros/urdfdom/blob/jazzy/urdf_parser/src/joint.cpp), the parser behind
+every ROS 2 URDF tool. A `revolute` or `prismatic` joint whose `<limit>` omits `effort` or
+`velocity` is rejected outright; `lower` and `upper` instead default silently to `0`, and a missing
+`<axis>` to `1 0 0`. Neither is an error; both are a robot that quietly does the wrong thing.
+
+## Three geometries, and why they differ
+
+A link can carry `<visual>`, `<collision>` and `<inertial>` blocks, kept separate because the three
+readers ask different questions: `<visual>` is what the renderer draws, `<collision>` what the
+physics engine tests for contact, `<inertial>` mass and how it is distributed. **Nothing ties them
+to each other**, and no tool checks that they agree.
+
+Collision geometry is normally far simpler than visual geometry, and the reason is cost. A physics
+engine runs contact queries every step, often a thousand times a second, between every pair of
+shapes that might touch. Against a sphere that is a subtraction; against a fifty-thousand-triangle
+mesh it is enormously more work. So real robots ship a mesh for `<visual>` and a few primitives, or
+one convex hull, for `<collision>`.
+
+Be honest about *this* model: twelve of its thirteen links declare identical geometry for both,
+because the visual is already a primitive with nothing to simplify. The saving is real when the
+visual is an artist's mesh, which this book does not have: meshes are an art problem, and a robot
+of boxes stays readable in one file. The head is where the difference shows:
+
+```xml
+<link name="head">
+  <visual>
+    <origin xyz="0 0 0.12" rpy="0 0 0"/>
+    <geometry>
+      <sphere radius="0.11"/>
+    </geometry>
+    <material name="body_grey"/>
+  </visual>
+  <visual>
+    <origin xyz="0.10 0 0.13" rpy="0 0 0"/>
+    <geometry>
+      <box size="0.03 0.12 0.04"/>
+    </geometry>
+    <material name="accent_orange"/>
+  </visual>
+  <collision>
+    <origin xyz="0 0 0.12" rpy="0 0 0"/>
+    <geometry>
+      <sphere radius="0.12"/>
+    </geometry>
+  </collision>
+  <inertial>
+    <origin xyz="0 0 0.12" rpy="0 0 0"/>
+    <mass value="2.5"/>
+    <inertia ixx="0.0121" ixy="0.0" ixz="0.0"
+             iyy="0.0121" iyz="0.0" izz="0.0121"/>
+  </inertial>
+</link>
+```
+
+Two `<visual>` elements, one `<collision>`; a link may carry as many of each as it likes. The second
+is an orange visor showing which way the head faces — worth a lot when a grey sphere otherwise has
+no front.
+
+Physics never sees it. It sees one sphere, of *radius 0.12 against the skull's 0.11*: a centimetre
+larger than what it stands for, so contact is reported a centimetre early —
+[Chapter 1.1](./physical-ai-embodied-intelligence.mdx)'s asymmetric-cost argument for `STOP_GAP`,
+where a doorframe missed by a centimetre costs a centimetre and met a centimetre late costs a head.
+
+It errs both ways at once, which is the part worth keeping: the sphere does not enclose the visor
+either, whose outer corners sit 1.0 to 1.3 cm *outside* it, so a robot that catches its visor on a
+shelf edge feels nothing. Collision geometry is a deliberate approximation; the job is not to make
+it exact but to know which way it is wrong.
+
+### Reading an inertial block
+
+`<mass>` is in kilograms, and `<origin>` is the centre of mass in the link's frame — here the middle
+of the skull, not the frame origin.
+
+`<inertia>` is the rotational equivalent of mass: how hard the link is to *spin up* about each
+axis. Six numbers, because it is a symmetric 3×3 matrix; the off-diagonals say how a torque about
+one axis produces rotation about another, and are `0.0` here because every shape is a symmetric
+primitive aligned with its own frame. They come from standard rigid-body formulas — for a solid box
+of mass *m* with extents *a*, *b*, *c* along x, y and z:
+
+- *ixx* = *m*(*b*² + *c*²)/12
+- *iyy* = *m*(*a*² + *c*²)/12
+- *izz* = *m*(*a*² + *b*²)/12
+
+For a solid sphere of radius *r*, all three are 2*mr*²/5 — where the head's `0.0121` comes from,
+using the **skull's 0.11 m**, not the collision sphere's 0.12. Three geometries, three independent
+choices.
+
+The parser treats `<inertial>` as optional: leave it out, the file still loads, and a physics
+engine has no mass for that link.
+
+## Why this robot has thirteen links
+
+A humanoid could be built from six links: torso, head, two arms, two legs. This one has thirteen,
+because the modules that follow need joints those six do not have. Standing the robot up in physics
+is only meaningful with knees and ankles — a biped stays upright by bending them, and a leg that is
+one rigid stick from hip to floor can only be tipped over. Walking anywhere needs feet with area,
+because a foot is the contact patch the robot pivots on. The waist buys turning the upper body
+without moving the feet; elbows make the arms something to reach with. Thirteen links and twelve
+joints is the smallest model that stays credible through the rest of the book. Each URDF joint is
+one degree of freedom, and a real hip stacks two or three, so this robot bends fore-and-aft only —
+enough to pose the balance problem, not solve it.
+
+## Example 1: the complete model
+
+Save this as `simple_humanoid.urdf`; it is the robot for the rest of this book.
+
+**Environment.** A text file, nothing to install, targeting URDF as parsed by `urdfdom` on
+**ROS 2 Jazzy Jalisco** / **Ubuntu 24.04 (Noble)**.
+
+```xml
+<?xml version="1.0"?>
+<!-- simple_humanoid: the running robot model for this book.
+     Units are SI (metres, kilograms, radians) and axes follow REP 103,
+     x forward, y left, z up. With every joint at zero the robot stands
+     upright, with the soles of both feet 0.85 m below the pelvis origin. -->
+<robot name="simple_humanoid">
+
+  <material name="body_grey">
+    <color rgba="0.55 0.57 0.60 1.0"/>
+  </material>
+  <material name="limb_blue">
+    <color rgba="0.20 0.35 0.65 1.0"/>
+  </material>
+  <material name="accent_orange">
+    <color rgba="0.85 0.45 0.10 1.0"/>
+  </material>
+
+  <!-- ============ pelvis: the root link ============ -->
+  <!-- base_link is the only link with no parent joint. REP 120 recommends
+       putting it at the waist, which is what this is: the pelvis block. -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="0.20 0.26 0.14"/>
+      </geometry>
+      <material name="body_grey"/>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="0.20 0.26 0.14"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="4.0"/>
+      <inertia ixx="0.029067" ixy="0.0" ixz="0.0"
+               iyy="0.019867" iyz="0.0" izz="0.035867"/>
+    </inertial>
+  </link>
+
+  <!-- ============ torso and head ============ -->
+  <joint name="waist_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="torso"/>
+    <origin xyz="0 0 0.07" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.60" upper="0.60" effort="80.0" velocity="2.0"/>
+  </joint>
+
+  <!-- The torso frame sits at the waist, so the box is offset upward by
+       half its height to put its centre where the chest is. -->
+  <link name="torso">
+    <visual>
+      <origin xyz="0 0 0.21" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.18 0.28 0.42"/>
+      </geometry>
+      <material name="body_grey"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.21" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.18 0.28 0.42"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0.21" rpy="0 0 0"/>
+      <mass value="12.0"/>
+      <inertia ixx="0.2548" ixy="0.0" ixz="0.0"
+               iyy="0.2088" iyz="0.0" izz="0.1108"/>
+    </inertial>
+  </link>
+
+  <joint name="neck_joint" type="revolute">
+    <parent link="torso"/>
+    <child link="head"/>
+    <origin xyz="0 0 0.42" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.57" upper="1.57" effort="10.0" velocity="3.0"/>
+  </joint>
+
+  <!-- Two visual shapes, one collision shape: a skull sphere plus a visor
+       box showing which way the head faces. Physics sees only the skull,
+       1 cm oversized; the visor's corners stick out of it. -->
+  <link name="head">
+    <visual>
+      <origin xyz="0 0 0.12" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.11"/>
+      </geometry>
+      <material name="body_grey"/>
+    </visual>
+    <visual>
+      <origin xyz="0.10 0 0.13" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.03 0.12 0.04"/>
+      </geometry>
+      <material name="accent_orange"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.12" rpy="0 0 0"/>
+      <geometry>
+        <sphere radius="0.12"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 0.12" rpy="0 0 0"/>
+      <mass value="2.5"/>
+      <inertia ixx="0.0121" ixy="0.0" ixz="0.0"
+               iyy="0.0121" iyz="0.0" izz="0.0121"/>
+    </inertial>
+  </link>
+
+  <!-- ============ left arm ============ -->
+  <joint name="l_shoulder_joint" type="revolute">
+    <parent link="torso"/>
+    <child link="l_upper_arm"/>
+    <origin xyz="0 0.185 0.37" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.00" upper="2.00" effort="30.0" velocity="3.0"/>
+  </joint>
+
+  <link name="l_upper_arm">
+    <visual>
+      <origin xyz="0 0 -0.13" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.045" length="0.26"/>
+      </geometry>
+      <material name="limb_blue"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.13" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.045" length="0.26"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 -0.13" rpy="0 0 0"/>
+      <mass value="1.2"/>
+      <inertia ixx="0.007367" ixy="0.0" ixz="0.0"
+               iyy="0.007367" iyz="0.0" izz="0.001215"/>
+    </inertial>
+  </link>
+
+  <joint name="l_elbow_joint" type="revolute">
+    <parent link="l_upper_arm"/>
+    <child link="l_lower_arm"/>
+    <origin xyz="0 0 -0.26" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.50" upper="0.00" effort="20.0" velocity="3.0"/>
+  </joint>
+
+  <link name="l_lower_arm">
+    <visual>
+      <origin xyz="0 0 -0.12" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.038" length="0.24"/>
+      </geometry>
+      <material name="limb_blue"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.12" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.038" length="0.24"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 -0.12" rpy="0 0 0"/>
+      <mass value="0.9"/>
+      <inertia ixx="0.004645" ixy="0.0" ixz="0.0"
+               iyy="0.004645" iyz="0.0" izz="0.00065"/>
+    </inertial>
+  </link>
+
+  <!-- ============ right arm (mirror of the left in y) ============ -->
+  <joint name="r_shoulder_joint" type="revolute">
+    <parent link="torso"/>
+    <child link="r_upper_arm"/>
+    <origin xyz="0 -0.185 0.37" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.00" upper="2.00" effort="30.0" velocity="3.0"/>
+  </joint>
+
+  <link name="r_upper_arm">
+    <visual>
+      <origin xyz="0 0 -0.13" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.045" length="0.26"/>
+      </geometry>
+      <material name="limb_blue"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.13" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.045" length="0.26"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 -0.13" rpy="0 0 0"/>
+      <mass value="1.2"/>
+      <inertia ixx="0.007367" ixy="0.0" ixz="0.0"
+               iyy="0.007367" iyz="0.0" izz="0.001215"/>
+    </inertial>
+  </link>
+
+  <joint name="r_elbow_joint" type="revolute">
+    <parent link="r_upper_arm"/>
+    <child link="r_lower_arm"/>
+    <origin xyz="0 0 -0.26" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.50" upper="0.00" effort="20.0" velocity="3.0"/>
+  </joint>
+
+  <link name="r_lower_arm">
+    <visual>
+      <origin xyz="0 0 -0.12" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.038" length="0.24"/>
+      </geometry>
+      <material name="limb_blue"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.12" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.038" length="0.24"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 -0.12" rpy="0 0 0"/>
+      <mass value="0.9"/>
+      <inertia ixx="0.004645" ixy="0.0" ixz="0.0"
+               iyy="0.004645" iyz="0.0" izz="0.00065"/>
+    </inertial>
+  </link>
+
+  <!-- ============ left leg ============ -->
+  <joint name="l_hip_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="l_thigh"/>
+    <origin xyz="0 0.09 -0.07" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.80" upper="0.60" effort="120.0" velocity="3.0"/>
+  </joint>
+
+  <link name="l_thigh">
+    <visual>
+      <origin xyz="0 0 -0.18" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.06" length="0.36"/>
+      </geometry>
+      <material name="limb_blue"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.18" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.06" length="0.36"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 -0.18" rpy="0 0 0"/>
+      <mass value="3.0"/>
+      <inertia ixx="0.0351" ixy="0.0" ixz="0.0"
+               iyy="0.0351" iyz="0.0" izz="0.0054"/>
+    </inertial>
+  </link>
+
+  <joint name="l_knee_joint" type="revolute">
+    <parent link="l_thigh"/>
+    <child link="l_shin"/>
+    <origin xyz="0 0 -0.36" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0.00" upper="2.20" effort="100.0" velocity="3.0"/>
+  </joint>
+
+  <link name="l_shin">
+    <visual>
+      <origin xyz="0 0 -0.18" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.05" length="0.36"/>
+      </geometry>
+      <material name="limb_blue"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.18" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.05" length="0.36"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 -0.18" rpy="0 0 0"/>
+      <mass value="2.2"/>
+      <inertia ixx="0.025135" ixy="0.0" ixz="0.0"
+               iyy="0.025135" iyz="0.0" izz="0.00275"/>
+    </inertial>
+  </link>
+
+  <joint name="l_ankle_joint" type="revolute">
+    <parent link="l_shin"/>
+    <child link="l_foot"/>
+    <origin xyz="0 0 -0.36" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.80" upper="0.80" effort="60.0" velocity="3.0"/>
+  </joint>
+
+  <!-- The ankle sits behind the middle of the foot, so the box is offset
+       forward in x. Its underside lands on z = 0 when the robot stands. -->
+  <link name="l_foot">
+    <visual>
+      <origin xyz="0.04 0 -0.03" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.22 0.10 0.06"/>
+      </geometry>
+      <material name="accent_orange"/>
+    </visual>
+    <collision>
+      <origin xyz="0.04 0 -0.03" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.22 0.10 0.06"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.04 0 -0.03" rpy="0 0 0"/>
+      <mass value="0.8"/>
+      <inertia ixx="0.000907" ixy="0.0" ixz="0.0"
+               iyy="0.003467" iyz="0.0" izz="0.003893"/>
+    </inertial>
+  </link>
+
+  <!-- ============ right leg (mirror of the left in y) ============ -->
+  <joint name="r_hip_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="r_thigh"/>
+    <origin xyz="0 -0.09 -0.07" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.80" upper="0.60" effort="120.0" velocity="3.0"/>
+  </joint>
+
+  <link name="r_thigh">
+    <visual>
+      <origin xyz="0 0 -0.18" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.06" length="0.36"/>
+      </geometry>
+      <material name="limb_blue"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.18" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.06" length="0.36"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 -0.18" rpy="0 0 0"/>
+      <mass value="3.0"/>
+      <inertia ixx="0.0351" ixy="0.0" ixz="0.0"
+               iyy="0.0351" iyz="0.0" izz="0.0054"/>
+    </inertial>
+  </link>
+
+  <joint name="r_knee_joint" type="revolute">
+    <parent link="r_thigh"/>
+    <child link="r_shin"/>
+    <origin xyz="0 0 -0.36" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0.00" upper="2.20" effort="100.0" velocity="3.0"/>
+  </joint>
+
+  <link name="r_shin">
+    <visual>
+      <origin xyz="0 0 -0.18" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.05" length="0.36"/>
+      </geometry>
+      <material name="limb_blue"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.18" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.05" length="0.36"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 -0.18" rpy="0 0 0"/>
+      <mass value="2.2"/>
+      <inertia ixx="0.025135" ixy="0.0" ixz="0.0"
+               iyy="0.025135" iyz="0.0" izz="0.00275"/>
+    </inertial>
+  </link>
+
+  <joint name="r_ankle_joint" type="revolute">
+    <parent link="r_shin"/>
+    <child link="r_foot"/>
+    <origin xyz="0 0 -0.36" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.80" upper="0.80" effort="60.0" velocity="3.0"/>
+  </joint>
+
+  <link name="r_foot">
+    <visual>
+      <origin xyz="0.04 0 -0.03" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.22 0.10 0.06"/>
+      </geometry>
+      <material name="accent_orange"/>
+    </visual>
+    <collision>
+      <origin xyz="0.04 0 -0.03" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.22 0.10 0.06"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0.04 0 -0.03" rpy="0 0 0"/>
+      <mass value="0.8"/>
+      <inertia ixx="0.000907" ixy="0.0" ixz="0.0"
+               iyy="0.003467" iyz="0.0" izz="0.003893"/>
+    </inertial>
+  </link>
+
+</robot>
+```
+
+That is a robot 1.57 m tall weighing 34.7 kg, standing with every joint at zero. The right side is
+the left with one sign flipped — duplication that **xacro**, a macro layer generating URDF from a
+shorter file, exists to remove. This book stays with plain URDF, easier to read than anything
+generated from it.
+
+## Example 2: walking the tree in plain Python
+
+A URDF is a file you edit by hand, and hand-edited XML goes wrong quietly. This script walks the
+tree from the root and prints it with totals, so after any edit you see the robot you actually
+have.
+
+**Environment.** **Python 3.8 or newer** and the standard library only — `xml.etree.ElementTree` is
+part of it. No ROS 2, no simulator, no third-party packages, so it runs on Windows, macOS or Linux;
+Ubuntu 24.04, this book's platform, ships 3.12. The output below is from Python 3.14.2. Save it
+beside `simple_humanoid.urdf`.
+
+```python
+"""Walk a URDF's joint tree and report what the file describes.
+
+Standard library only: no ROS 2 and no third-party parser required.
+Usage: python urdf_tree.py [path-to-urdf]
+"""
+
+import sys
+import xml.etree.ElementTree as ET
+
+
+def read_model(path):
+    """Return (links, joints) from a URDF file, both in document order.
+
+    links maps a link name to its mass in kg, 0.0 if it has no <inertial>.
+    joints is a list of (name, type, parent, child) tuples.
+    """
+    robot = ET.parse(path).getroot()
+
+    links = {}
+    for link in robot.findall('link'):
+        mass = link.find('inertial/mass')
+        links[link.get('name')] = 0.0 if mass is None else float(mass.get('value'))
+
+    joints = []
+    for joint in robot.findall('joint'):
+        joints.append((joint.get('name'),
+                       joint.get('type'),
+                       joint.find('parent').get('link'),
+                       joint.find('child').get('link')))
+
+    return links, joints
+
+
+def find_roots(links, joints):
+    """Return the links that are never a joint's child."""
+    children = [child for (_, _, _, child) in joints]
+    return [name for name in links if name not in children]
+
+
+def print_branch(parent, links, joints, depth):
+    """Print every joint hanging off `parent`, then recurse. Returns links seen."""
+    seen = 0
+    for name, jtype, joint_parent, child in joints:
+        if joint_parent != parent:
+            continue
+        print('%s%s [%s] -> %s  %.2f kg'
+              % ('  ' * depth, name, jtype, child, links[child]))
+        seen += 1 + print_branch(child, links, joints, depth + 1)
+    return seen
+
+
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else 'simple_humanoid.urdf'
+    links, joints = read_model(path)
+
+    roots = find_roots(links, joints)
+    if len(roots) != 1:
+        print('not a tree: expected 1 root link, found %d: %s' % (len(roots), roots))
+        return 1
+    if len(links) != len(joints) + 1:
+        print('not a tree: %d links need %d joints, found %d'
+              % (len(links), len(links) - 1, len(joints)))
+        return 1
+
+    root = roots[0]
+    print('%s  %.2f kg  (root)' % (root, links[root]))
+    reached = 1 + print_branch(root, links, joints, 1)
+
+    print()
+    print('links:      %d' % len(links))
+    print('joints:     %d' % len(joints))
+    print('reached:    %d' % reached)
+    print('total mass: %.3f kg' % sum(links.values()))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+```
+
+Save it as `urdf_tree.py` and run it:
+
+```text
+base_link  4.00 kg  (root)
+  waist_joint [revolute] -> torso  12.00 kg
+    neck_joint [revolute] -> head  2.50 kg
+    l_shoulder_joint [revolute] -> l_upper_arm  1.20 kg
+      l_elbow_joint [revolute] -> l_lower_arm  0.90 kg
+    r_shoulder_joint [revolute] -> r_upper_arm  1.20 kg
+      r_elbow_joint [revolute] -> r_lower_arm  0.90 kg
+  l_hip_joint [revolute] -> l_thigh  3.00 kg
+    l_knee_joint [revolute] -> l_shin  2.20 kg
+      l_ankle_joint [revolute] -> l_foot  0.80 kg
+  r_hip_joint [revolute] -> r_thigh  3.00 kg
+    r_knee_joint [revolute] -> r_shin  2.20 kg
+      r_ankle_joint [revolute] -> r_foot  0.80 kg
+
+links:      13
+joints:     12
+reached:    13
+total mass: 34.700 kg
+```
+
+The indentation *is* the kinematic chain: to know where the left foot is, multiply the four
+transforms above it. Two checks run before anything prints, and either one stops the script:
+**exactly one root** — a link that is nobody's child — catches a joint you deleted or a link you
+never attached, and **links = joints + 1** catches the reverse. A third number, **`reached`**, is
+counted during the walk and printed last for you — and only you — to compare: below `links` means
+part of the robot hangs off something that is not the root. The output is deterministic: `findall`
+returns document order and dictionaries preserve insertion order.
+
+## Validating and visualizing the model
+
+### Validating
+
+`check_urdf` parses a file with the library every ROS 2 tool uses and reports the tree it found. On
+Ubuntu 24.04 it comes from `liburdfdom-tools`, independently of ROS.
+
+**Environment.** **Ubuntu 24.04 (Noble)**, `sudo apt install liburdfdom-tools`. Run from the
+directory holding the model.
+
+```bash
+check_urdf simple_humanoid.urdf
+```
+
+On success it prints the robot's name, a `Successfully Parsed XML` banner, and the same indented
+tree, from the official parser. On failure it exits non-zero; two of its messages are the tree
+rule restated — `Two root links found: [name] and [name]` and
+`No root link found. The robot xml is not a valid tree.`
+([source](https://github.com/ros/urdfdom_headers/blob/jazzy/include/urdf_model/model.h)).
+
+It does not check whether the robot makes sense — nothing rejects a 400 kg forearm or two feet in
+the same place. Legality is not plausibility.
+
+### Visualizing
+
+Seeing the model takes three nodes, two of them consumers from the start of this chapter: `rviz2`
+visualizes, `robot_state_publisher` does kinematics. The third only moves joints; the physics
+consumer waits for Module 2.
+
+- **`robot_state_publisher`** reads the URDF from a [parameter](./python-agents-rclpy.mdx) named
+  `robot_description`, subscribes to `/joint_states`, and publishes a transform for every link on
+  `/tf`. It republishes the URDF on a `/robot_description` topic — how the other two get the model.
+- **`joint_state_publisher_gui`** gives one slider per non-fixed joint, bounded by the `<limit>`
+  you wrote, publishing on `/joint_states`.
+- **`rviz2`** draws it. Its **RobotModel** display has separate **Visual Enabled** (on) and
+  **Collision Enabled** (off) checkboxes: swap them to see what the physics engine sees.
+
+Running three nodes together, one carrying a whole file as a parameter, is what ROS 2 *launch
+files* are for; later modules start several nodes at once. Launch is taught where it is needed;
+this is a recipe to run, not a thing to master here. `LaunchDescription` lists what to start, each
+`Node` is one entry, `Command` runs a shell command, and `ParameterValue` marks the result a string
+rather than YAML to parse. `launch_ros.actions` is nothing to do with ROS 2 actions, the third
+primitive named in [Chapter 1.2](./ros2-architecture.mdx).
+
+**Environment.** **ROS 2 Jazzy Jalisco** on **Ubuntu 24.04 (Noble)** with a display. Install with
+`sudo apt install ros-jazzy-robot-state-publisher ros-jazzy-joint-state-publisher-gui ros-jazzy-rviz2`
+— `robot_state_publisher` and `rviz2` come with `ros-jazzy-desktop`, but
+`joint_state_publisher_gui` is in no desktop variant and must be installed separately. Save this as
+`display_humanoid.launch.py` beside `simple_humanoid.urdf`.
+
+```python
+"""Start robot_state_publisher, the joint slider GUI, and RViz for one URDF."""
+
+import os
+
+from launch import LaunchDescription
+from launch.substitutions import Command
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+
+URDF_PATH = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), 'simple_humanoid.urdf')
+
+
+def generate_launch_description():
+    robot_description = ParameterValue(
+        Command(['cat ', URDF_PATH]), value_type=str)
+
+    return LaunchDescription([
+        Node(package='robot_state_publisher',
+             executable='robot_state_publisher',
+             parameters=[{'robot_description': robot_description}]),
+        Node(package='joint_state_publisher_gui',
+             executable='joint_state_publisher_gui'),
+        Node(package='rviz2',
+             executable='rviz2',
+             output='screen'),
+    ])
+```
+
+```bash
+source /opt/ros/jazzy/setup.bash
+ros2 launch ./display_humanoid.launch.py
+```
+
+RViz opens with only a grid and a **Fixed Frame** of `/map`, which this robot has no transform for.
+Set it to `base_link`, then **Add** a **RobotModel** display with **Description Topic**
+`/robot_description`. Drag `l_elbow_joint` to its limit and the forearm stops; drag `neck_joint`
+and the visor swings round.
+
+## Exercises
+
+All four use the files above. Only Exercise 2 reaches beyond `urdf_tree.py`, and only optionally,
+for `check_urdf` — which needs Ubuntu, not ROS 2.
+
+**1. Describe the robot without looking at it.** From the file alone, add the joint `<origin>`
+values along each chain, then the geometry at the end, for (a) the height of the skull top above
+the pelvis origin, (b) the depth of the soles below it, (c) the total height.
+*Correct result*: 0.72 m, 0.85 m, 1.57 m, with `urdf_tree.py` supplying the chains and confirming
+`total mass: 34.700 kg`.
+
+**2. Break the tree two ways.** On a copy, delete the whole `l_knee_joint` element and run
+`urdf_tree.py`; then restore it and change its `<parent>` from `l_thigh` to `l_shin`.
+*Correct result*: the first prints
+`not a tree: expected 1 root link, found 2: ['base_link', 'l_shin']` and nothing else. The second
+prints a tree that looks almost right, but `reached: 11` against `links: 13`, and the left leg
+stops at the thigh. Say which edit `check_urdf` would also reject, and why the other is more
+dangerous.
+
+**3. Give the robot a left hand.** Add a link `l_hand` — a box `0.08 0.10 0.06` of mass 0.4 kg,
+all three origins at `0 0 -0.03` — on `l_lower_arm` by a revolute `l_wrist_joint` with
+`origin xyz="0 0 -0.24"`, `axis xyz="0 1 0"`, limits of ±0.80 rad, `effort="10.0" velocity="3.0"`.
+Get the inertia from the box formulas above, to six decimals.
+*Correct result*: `ixx="0.000453" iyy="0.000333" izz="0.000547"`, off-diagonals `0.0`, and
+`urdf_tree.py` reporting `links: 14`, `joints: 13`, `reached: 14`, `total mass: 35.100 kg`, with
+`l_wrist_joint [revolute] -> l_hand  0.40 kg` one level under `l_elbow_joint`. Say why the joint's
+origin is `-0.24` and not `-0.12`.
+
+**4. Choose where the approximation errs.** The visor's outer corners are at `(0.115, ±0.06, 0.11)`
+and `(0.115, ±0.06, 0.15)`; the collision sphere is centred at `(0, 0, 0.12)` with radius `0.12`.
+Compute how far outside the sphere each corner sits, then the radius that would enclose the visor.
+*Correct result*: about 1.0 cm and 1.3 cm outside, and a radius of about 0.133 m. Say what that
+larger sphere would cost everywhere else on the head, and which error you would rather live with.
+
+You can now read a robot's body out of a file, extend it, and check that what you wrote is still a
+robot — the last thing Module 1 owed you, after transport and the agent skeleton. Next comes a
+world to stand the robot in, and a physics engine that takes these masses and collision shapes far
+more literally than you might like.
