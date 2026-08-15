@@ -1,0 +1,739 @@
+---
+sidebar_position: 3
+title: "Physics, Gravity & Collisions"
+---
+
+# Physics, Gravity & Collisions
+
+At the end of [Chapter 2.1](./gazebo-setup-and-basics.mdx) you pressed Play and the robot fell down.
+
+That is the correct outcome, and worth more than a working demo, because it is the first time
+anything in this book has *disagreed* with you. Until Chapter 2.1, nothing had tested a single claim
+in `simple_humanoid.urdf`. A physics engine tests all of them several thousand times a second, and
+takes every number far more literally than you meant it.
+
+This chapter is about what happens in each of those one-millisecond steps, and about the two
+separate reasons — not one — that the humanoid ends up on the floor. Neither is a bug.
+
+## Learning objectives
+
+By the end of this chapter you will be able to:
+
+- Explain why the book's humanoid falls over, in terms of what the physics engine computes rather
+  than which parameter is wrong.
+- Identify which physical property — mass, the inertia tensor, the centre of mass, friction,
+  collision geometry — to change in order to affect a given behaviour, and predict the direction of
+  the change.
+- Describe what shrinking the physics step buys you and what it costs.
+- Measure a fall programmatically from a Python ROS 2 node instead of judging it by eye.
+
+## What the engine actually computes
+
+A physics engine solves **forward dynamics**: given the state of every body and the forces on it,
+find the state a moment later. It cannot do that in closed form for a system with contacts, so it
+does it in slices. One slice is one **step**, and `empty.sdf` sets that slice to 1 ms.
+
+Each step runs the same five stages.
+
+1. **Collect state.** Position, orientation, linear and angular velocity for all thirteen links.
+2. **Apply external forces.** Gravity, mostly — one force per link, proportional to its mass.
+3. **Collision detection.** Find every pair of collision shapes that overlap or are about to, and
+   where.
+4. **Constraint solving.** The expensive stage, and the interesting one. The engine holds a list of
+   things that must remain true — the knee's two links stay connected and rotate only about the knee
+   axis; the foot does not sink into the ground; the foot does not slide unless the tangential force
+   exceeds what friction can resist — and solves for the forces making all of them true
+   *simultaneously*. Joints and contacts go into the same solve, which is why a bad joint and a bad
+   contact produce similarly strange results.
+5. **Integrate.** Advance velocities by the accelerations just computed, positions by the velocities,
+   and stop.
+
+Then do it again. Gazebo Harmonic's default engine for this is **DART**, loaded as
+`gz-physics-dartsim-plugin`; `gz sim --physics-engine gz-physics-bullet-featherstone-plugin` swaps
+it. The choice changes numbers at the margins and is not this chapter's subject — every engine runs
+those five stages, and everything below is about what *you* hand them.
+
+Notice what is absent. Nothing in that list decides what the robot should *do*. There is no stage
+where a knee is held at an angle, because holding a knee at an angle is a force, and no force in
+this simulation has an author.
+
+## Mass, inertia, and the centre of mass
+
+Three quantities, easy to blur together, that do different jobs in stage 4.
+
+**Mass** resists linear acceleration: *F* = *ma*. The humanoid's thirteen links sum to 34.7 kg, so
+under gravity it is pulled down by 34.7 × 9.8 = **340 N**, and 340 N is what its two feet have to
+push back with to hold it up.
+
+**The inertia tensor** is the rotational counterpart: how hard the link is to *spin up* about each
+axis. [Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx) introduced the six numbers and the box
+and sphere formulas they came from. Until now they have been XML. In stage 4 they become the matrix
+the solver inverts to turn a torque into an angular acceleration, and that is the whole reason a
+wrong one is catastrophic rather than merely inaccurate — the tensor is not a value the engine
+reports back to you, it is a value the engine *divides by*.
+
+**The centre of mass** is where the link's `<inertial><origin>` puts it, which is a separate choice
+from where the visual shape is. Chapter 1.4's torso illustrates it: the link frame sits at the
+waist, and the inertial origin is offset to `0 0 0.21` to put the mass where the chest actually is.
+Get that offset wrong and the mass is right, the shape is right, and the robot still leans.
+
+For the whole robot it is the mass-weighted average of the links'. Summing Chapter 1.4's thirteen
+`<inertial>` blocks with every joint at zero puts the humanoid's centre of mass at **x = 0.002 m,
+y = 0.000 m, z = 0.007 m** in the `base_link` frame — almost exactly at the pelvis, where a roughly
+human mass distribution should put it. The soles sit 0.85 m below `base_link`, so it stands
+**0.857 m above the ground**. Hold on to that number; the second half of the chapter is about it.
+
+### Why a wrong inertia tensor makes a robot absurd
+
+The single most common way to break a simulated robot is a unit slip. CAD packages report inertia
+in kg·mm²; URDF wants kg·m². The conversion factor is 10⁶, and pasting the CAD figure without it
+makes every tensor a million times too large.
+
+The torso's real `izz` is 0.1108 kg·m², so 1 N·m about its vertical axis gives 1 / 0.1108 ≈ 9 rad/s².
+With the CAD figure pasted in, `izz` is 110800 kg·m² and the same torque produces 9 × 10⁻⁶ rad/s².
+The torso does not become heavy; it becomes *unturnable* — and the failure is peculiar because
+everything else still looks right. It is 12 kg, gravity pulls on it correctly, it falls at 9.8 m/s².
+It simply refuses to rotate while doing so, and a robot whose torso will not turn but whose arms will
+behaves in a way no real object does.
+
+The error runs the other way too, and worse. Too *small* a tensor makes the link a hair trigger,
+spun violently by a small contact impulse — and since contact impulses arrive every step, that
+usually means the robot explodes on the first frame. The pathological case is zero inertia, or an
+`<inertial>` block omitted. Chapter 1.4 noted the parser treats `<inertial>` as optional; it is
+optional to the *parser*. To the solver a zero-inertia link is a division by zero dressed up as a
+robot part.
+
+The rule this gives you is the diagnostic habit the rest of the module depends on:
+
+> If a body **translates** wrongly, suspect mass, gravity, or contact. If a body **rotates**
+> wrongly — too fast, too slow, or about an axis that makes no sense — suspect the inertia tensor.
+> If a body is wrongly *placed* while moving plausibly, suspect the inertial origin.
+
+## Gravity
+
+Gravity is a property of the world, not of the robot. In `empty.sdf` it is one line:
+
+```xml
+<gravity>0 0 -9.8</gravity>
+```
+
+Three components in m/s² along the world axes. Set it to `0 0 0` and the humanoid hangs where you
+spawned it; `0 0 -1.62` gives you the Moon.
+
+Be precise about gravity's role in the fall, because it is easy to blame it and stop thinking.
+Gravity does not make the robot unstable. It makes the instability *visible* — a constant, uniform
+340 N of load that finds every direction the structure cannot resist in. Turn gravity off and the
+humanoid does not become balanced; it becomes untested.
+
+## Collision and contact
+
+Stage 3 answers "what is touching what". Naively that is *n*²/2 shape-pair checks, so engines split
+it: a **broad phase** discarding pairs that cheap bounding volumes prove cannot touch, and a
+**narrow phase** computing exact contact points for the survivors. That split is why a robot of
+simple primitives simulates fast and one wearing a 200,000-triangle mesh does not.
+
+Stage 4 answers "what does touching *do*". A contact becomes a constraint: the shapes must not
+interpenetrate, so the solver finds the normal impulse cancelling the approaching velocity. It is a
+constraint, not a spring — the engine is not pushing the foot out of the ground, it is refusing to
+let it in. A little interpenetration is tolerated and corrected over later steps, because forbidding
+it strictly produces a stiff problem needing tiny steps; that is why a resting foot in a simulator
+sits a fraction of a millimetre inside the floor rather than exactly on it.
+
+Two consequences you meet immediately:
+
+**The engine sees `<collision>`, never `<visual>`.** Chapter 1.4 made the head's collision sphere
+`0.12` against the skull's visual `0.11`, and gave it no visor at all. This robot's head contacts a
+doorframe a centimetre before the picture touches, and its visor clips straight through with no
+contact at all. Picture and physics are independent statements; only one is enforced.
+
+**Adjacent links do not collide.** Links joined by a joint have their collision checks disabled by
+default — otherwise thigh and shin, sharing a surface at the knee, would be in permanent violent
+contact. The cost is that the humanoid's arm passes through its own torso, since self-collision is
+off by default for the whole model and enabling it is expensive.
+
+## Friction
+
+The normal impulse stops the foot sinking. Nothing yet stops it sliding.
+
+Friction is the tangential half of the contact constraint, and engines implement Coulomb's model:
+the tangential force available is at most **μ** times the normal force — below that the contact
+sticks, at it the contact slides. Since μ describes a *pair* of surfaces and the engine knows only
+each shape separately, it combines the two values, so the friction under the humanoid's foot depends
+on the foot *and* the ground plane. In SDF it lives inside the collision element:
+
+```xml
+<collision name="collision">
+  <geometry>
+    <box><size>0.22 0.10 0.06</size></box>
+  </geometry>
+  <surface>
+    <friction>
+      <ode>
+        <mu>1.0</mu>
+        <mu2>1.0</mu2>
+      </ode>
+    </friction>
+  </surface>
+</collision>
+```
+
+`mu` and `mu2` are the coefficients along two perpendicular tangential directions — the friction
+*pyramid*, a linear approximation of the true friction cone, used because a pyramid fits the
+solver's linear machinery and a cone does not. Both default to **1.0**, a fairly grippy surface,
+roughly rubber on concrete; setting `mu` ≠ `mu2` is how you model a wheel or a ski.
+
+Chapter 1.4's URDF specifies no friction anywhere, so every contact in Chapter 2.1 used defaults on
+both sides. Know that before you conclude anything about the fall: μ = 1.0 under both feet is
+generous, and the robot still went down. Friction is not what is missing.
+
+## Why the biped falls, and what that reveals
+
+Now the chapter's real question. The humanoid is dropped 5 cm onto a high-friction floor and
+collapses. There are **two independent failures** here, and readers usually see only one of them,
+which is why "add a controller" tends to be the wrong first move.
+
+### Failure one: nothing holds the joints
+
+Chapter 1.4 gave `l_knee_joint` an `effort="100.0"`. It is easy to read that as a motor. It is not.
+In URDF, `effort` is a *limit* — a ceiling on what an actuator may command, a statement about a
+motor that might exist. It commands nothing.
+
+Chapter 2.1 already told you the mechanical reason this stays true in simulation: the URDF carries
+no `<gazebo>` tags, so no Gazebo system attaches to the model, so nothing is driving any joint. In
+stage 4 the knee constraint says only *these two links stay connected and rotate about this axis*.
+It says nothing about which angle. A joint with no actuator, no damping and no friction is a
+frictionless hinge, and thirteen links on twelve frictionless hinges is not a robot standing up. It
+is a chain, and a chain under gravity finds the floor.
+
+This is the failure that dominates the first half-second, and it is a *postural* failure, not a
+balance failure. Even a robot with perfect balance would still be a puddle if its joints were free.
+
+### Failure two: it would tip over anyway
+
+Suppose you fixed failure one — welded every joint, so the humanoid became one rigid 34.7 kg body
+in exactly the pose Chapter 1.4 describes. It would still fall, and this second failure is the one
+that generalises.
+
+A body standing on the ground is stable only while the vertical line through its centre of mass
+lands inside its **support polygon** — the convex hull of everything touching the ground. Compute
+both for this robot from Chapter 1.4's numbers.
+
+The foot collision boxes are 0.22 × 0.10 × 0.06 m, offset `0.04` forward in each ankle frame, with
+the ankles at y = ±0.09. So the support polygon spans **x from −0.070 to +0.150 m** and **y from
+−0.140 to +0.140 m**. The centre of mass sits at x = 0.002, y = 0.000, and 0.857 m up. That leaves:
+
+| Direction | Margin | Lean before tipping |
+|---|---|---|
+| Backwards | 0.072 m | **4.8°** |
+| Forwards | 0.148 m | 9.8° |
+| Sideways | 0.140 m | 9.3° |
+
+Two things fall out of that table. The margins are tiny — under five degrees backwards. And they are
+**asymmetric**, not arbitrarily: the feet project forward of the ankle, exactly as human feet do,
+which is what makes the forward margin twice the backward one. You did not design that in Chapter
+1.4; it fell out of a `0.04` offset on a collision box. Physical properties chosen for one reason
+determine behaviour you were not thinking about.
+
+Now the part that makes balance hard rather than merely fiddly. A body balanced on a small base with
+its mass high above it is an **inverted pendulum**, whose upright position is an *unstable*
+equilibrium: any lean produces a gravitational torque that increases the lean. The deviation grows
+exponentially, with a time constant of
+
+  τ = √(L / g) = √(0.857 / 9.8) = **0.30 s**
+
+Start it one degree off vertical and it reaches the 4.8° backward tipping limit in about **0.67 s**.
+That number is the whole problem. It is not that the robot is badly built; it is that a humanoid has
+roughly two thirds of a second to notice an error and correct it, and the window shrinks as the
+error grows. Every "balance" technique you will meet later — measuring the tilt, moving the centre
+of pressure inside the foot, taking a step to put the support polygon back under the falling mass —
+is an answer to that arithmetic.
+
+Note that both terms in τ are things you can read off the model. Lower the centre of mass and τ
+grows and balancing gets easier, which is why so many real robots carry their batteries in the
+shins. Bigger feet enlarge the support polygon and buy margin, which is why humanoid feet look the
+way they do.
+
+### What this chapter does not do
+
+It does not balance the robot. Doing so needs two things the book has not built: a way to *measure*
+the tilt, which is a sensor and therefore the next chapter's subject, and a way to *apply* torque at
+the joints, which is a controller. **Balance is the open problem here, named and left open.** What
+you should take away is why it is hard — 0.30 seconds and 4.8 degrees — rather than a parameter to
+change.
+
+## The step size trade-off
+
+One number in the world file governs everything above:
+
+```xml
+<physics name="default" type="dart">
+  <max_step_size>0.001</max_step_size>
+  <real_time_factor>1.0</real_time_factor>
+</physics>
+```
+
+`max_step_size` is the slice of simulated time each step advances, in seconds; Gazebo's shipped
+worlds default to 1 ms. Three pressures act on it in different directions.
+
+**Accuracy.** Integration assumes forces are constant across the step. They are not, so each step
+accumulates error, and error per simulated second falls as the step shrinks.
+
+**Stability.** The pressure people underestimate. Contact and joint constraints are *stiff* — large
+forces over very short distances — and integrating a stiff system with too large a step makes the
+error not merely grow but **diverge**: the correction overshoots, the next overshoots further, and
+the model detonates. That is why the classic symptom of an overlarge step is not "slightly wrong"
+but "the robot vibrates, then leaves the scene".
+
+**Speed.** Cost is per step, so halving `max_step_size` doubles the computation per simulated
+second. At 1 ms the engine runs 1000 steps per simulated second; at 0.1 ms, 10,000. A machine
+holding real-time factor 1.0 now manages about 0.1 — and
+[Chapter 2.1](./gazebo-setup-and-basics.mdx)'s point returns with force, because your nodes with
+`use_sim_time: true` do not degrade gracefully, they simply live in a world where a wall-clock
+minute buys six simulated seconds. A day-long training run becomes ten days.
+
+So: **shrink the step until the simulation is stable and accurate enough for the question you are
+asking, and not one step further.** For a walking humanoid with stiff foot contacts, 1 ms is a
+reasonable default and 5 ms is often already too coarse; for a wheeled robot rolling across a flat
+floor, 10 ms may be fine. There is no globally correct value, only one that is correct for your
+contacts.
+
+`real_time_factor` is a *cap*, not a target: 1.0 asks Gazebo not to outrun reality even if it could,
+and `0` removes the cap — what you want for headless data generation, not for watching.
+
+---
+
+## Running it
+
+**None of the commands or programs below have been executed by the author**, who wrote this chapter
+on Windows with no ROS 2, no Gazebo, and no OpenGL-capable Linux graphics stack. Message types, SDF
+element names, and command-line flags were checked against the official Gazebo Harmonic
+documentation and the SDFormat specification, and both Python programs were syntax-checked, but
+**Examples 1 and 2 are pending execution in a Gazebo-capable environment**. The one part that could
+be run here — the URDF-editing script in Example 2, which is plain Python and touches nothing else —
+was run, and its output is reproduced as printed. Everywhere else, described behaviour follows from
+the mechanism above, not from a transcript.
+
+### Environment
+
+Both examples assume ROS 2 **Jazzy Jalisco** and Gazebo **Harmonic** on **Ubuntu 24.04 (Noble)**,
+installed exactly as in [Chapter 2.1](./gazebo-setup-and-basics.mdx):
+
+```bash
+sudo apt update
+sudo apt install ros-jazzy-ros-gz
+```
+
+Source every terminal with `source /opt/ros/jazzy/setup.bash`. You need `simple_humanoid.urdf` from
+[Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx) at `~/humanoid/simple_humanoid.urdf`, and you
+need to be comfortable with the spawn-and-bridge sequence from Chapter 2.1, which is used here
+unchanged.
+
+### Example 1: measuring the fall instead of watching it
+
+*Status: pending execution in a Gazebo-capable environment. Syntax-checked with `python -m
+py_compile`; uses [Chapter 1.3](../ros2/python-agents-rclpy.mdx)'s node skeleton unchanged.*
+
+"It fell over" is not a measurement, and eyes are poor at telling a robot that crumpled from one
+that toppled. This node reads the fall as numbers.
+
+It listens to `/world/empty/pose/info`, the scene broadcaster topic from Chapter 2.1, bridged as
+`tf2_msgs/msg/TFMessage` — the pairing you worked out in that chapter's fourth exercise. One detail
+governs how to read it: the scene broadcaster publishes each entity's pose **relative to its
+parent**, so the *model* entry is in world coordinates while *link* entries are relative to the
+model. The node prints each tracked transform's parent frame on arrival so you can confirm that
+rather than take it on faith.
+
+That gives two independent numbers, and the pair is the point. The model's **world height** says how
+far the robot dropped. The head's height **relative to the model** says whether it kept its shape:
+the head frame sits 0.490 m above `base_link` with every joint at zero, and stays there through any
+rigid topple, so a shrinking value is the joints buckling. One number separates tipping from
+collapsing. Save as `fall_probe.py`:
+
+```python
+"""Measures the humanoid's fall numerically from bridged Gazebo pose data."""
+
+import rclpy
+from rclpy.node import Node
+
+from tf2_msgs.msg import TFMessage
+
+POSE_TOPIC = '/world/empty/pose/info'
+MODEL = 'simple_humanoid'
+HEAD = 'head'
+
+HEAD_REST_Z = 0.490      # m above base_link with every joint at zero
+SPAWN_Z = 0.9            # m, the -z given to ros_gz_sim create
+REPORT_PERIOD = 0.5      # s of sim time between report lines
+SETTLE_WINDOW = 1.0      # s of sim time the height must stay still
+SETTLE_TOLERANCE = 0.002  # m
+
+
+def stamp_seconds(stamp):
+    """Convert a builtin_interfaces/msg/Time into float seconds."""
+    return stamp.sec + stamp.nanosec * 1e-9
+
+
+def short_name(frame):
+    """'simple_humanoid/base_link' -> 'base_link'; plain names pass through."""
+    return frame.rsplit('/', 1)[-1]
+
+
+class FallProbe(Node):
+
+    def __init__(self):
+        super().__init__('fall_probe')
+
+        self.create_subscription(TFMessage, POSE_TOPIC, self.on_poses, 10)
+        self.create_timer(REPORT_PERIOD, self.on_report)
+
+        self.t_zero = None
+        self.t_now = 0.0
+        self.world_z = None
+        self.head_rel_z = None
+        self.lowest_world_z = None
+        self.fastest_drop = 0.0
+        self.previous = None       # (t, world z) from the last message
+        self.history = []          # recent (t, world z) inside the settle window
+        self.settled_at = None
+        self.announced = set()
+
+        self.get_logger().info(
+            'listening on %s -- start the bridge if nothing arrives'
+            % POSE_TOPIC)
+
+    def on_poses(self, msg):
+        for transform in msg.transforms:
+            name = short_name(transform.child_frame_id)
+            if name not in (MODEL, HEAD):
+                continue
+
+            if name not in self.announced:
+                self.announced.add(name)
+                self.get_logger().info(
+                    'tracking %r, whose pose is expressed in %r'
+                    % (transform.child_frame_id, transform.header.frame_id))
+
+            t = stamp_seconds(transform.header.stamp)
+            if self.t_zero is None:
+                self.t_zero = t
+            self.t_now = t - self.t_zero
+
+            z = transform.transform.translation.z
+            if name == HEAD:
+                self.head_rel_z = z
+            else:
+                self.track_model(self.t_now, z)
+
+    def track_model(self, t, z):
+        self.world_z = z
+        if self.lowest_world_z is None or z < self.lowest_world_z:
+            self.lowest_world_z = z
+
+        if self.previous is not None:
+            dt = t - self.previous[0]
+            if dt > 0.0:
+                rate = (z - self.previous[1]) / dt
+                self.fastest_drop = min(self.fastest_drop, rate)
+        self.previous = (t, z)
+
+        self.history.append((t, z))
+        while self.history and t - self.history[0][0] > SETTLE_WINDOW:
+            self.history.pop(0)
+        self.check_settled(t)
+
+    def check_settled(self, t):
+        if self.settled_at is not None or len(self.history) < 2:
+            return
+        if t - self.history[0][0] < SETTLE_WINDOW:
+            return
+
+        heights = [h for _, h in self.history]
+        if max(heights) - min(heights) > SETTLE_TOLERANCE:
+            return
+
+        self.settled_at = t
+        deviation = abs(self.head_rel_z - HEAD_REST_Z) \
+            if self.head_rel_z is not None else float('nan')
+        self.get_logger().info(
+            'SETTLED at sim t %.2f s | world z %.3f m | dropped %.3f m from '
+            'spawn | fastest descent %.2f m/s | head rel z %.3f m '
+            '(deviation %.3f m)'
+            % (t, self.world_z, SPAWN_Z - self.world_z, self.fastest_drop,
+               self.head_rel_z if self.head_rel_z is not None else float('nan'),
+               deviation))
+
+    def on_report(self):
+        if self.world_z is None:
+            self.get_logger().warning('no poses yet on %s' % POSE_TOPIC)
+            return
+        if self.settled_at is not None:
+            return
+
+        head = self.head_rel_z if self.head_rel_z is not None else float('nan')
+        self.get_logger().info(
+            't %5.2f s | world z %.3f m | lowest %.3f m | head rel z %.3f m '
+            '(rest %.3f)'
+            % (self.t_now, self.world_z, self.lowest_world_z, head,
+               HEAD_REST_Z))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = FallProbe()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+Four terminals, all sourced. Start Gazebo **paused** so the probe is watching before anything moves:
+
+```bash
+gz sim -v 4 empty.sdf
+```
+
+```bash
+ros2 run ros_gz_sim create \
+  -world empty \
+  -file ~/humanoid/simple_humanoid.urdf \
+  -name simple_humanoid \
+  -z 0.9
+```
+
+```bash
+ros2 run ros_gz_bridge parameter_bridge \
+  /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock \
+  /world/empty/pose/info@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V
+```
+
+```bash
+python3 fall_probe.py --ros-args -p use_sim_time:=true
+```
+
+`use_sim_time:=true` matters more here than in Chapter 2.1: every time in this node's output is
+simulated time taken from message stamps, and a 0.5 s report timer reading the wall clock would
+sample a paused world.
+
+Now press **Play** and read the numbers.
+
+- **World z** starts at 0.900 and drops. The first 0.05 m is free fall, which takes
+  √(2 × 0.05 / 9.8) ≈ 0.10 s and arrives at √(2 × 9.8 × 0.05) ≈ 0.99 m/s. That prediction is the
+  sanity check on your whole setup: if the early `fastest descent` is nowhere near −1 m/s, something
+  about mass, gravity, or the spawn height is not what you think.
+- **Lowest** keeps the deepest point reached, so a bounce shows as a gap between it and the settled
+  height.
+- **Head rel z** is the diagnosis. Chapter 2.1 predicted a collapse rather than a topple; this is how
+  you check that claim instead of believing it. A rigid topple leaves it at 0.490, so any sustained
+  departure is the joints giving way — failure one, as a measurement.
+- **SETTLED** prints once the world height has held within 2 mm for a simulated second. Write down
+  the settled world z and the head deviation; Example 2 changes one number in the model and asks
+  what happens to that pair.
+
+If nothing arrives, work down Chapter 2.1's three-step bridge diagnosis — the pose topic is bridged
+Gazebo → ROS 2 with `[`, and a bidirectional `@` would make ROS 2 a publisher on Gazebo's own pose
+topic.
+
+### Example 2: breaking the inertia tensor on purpose
+
+*Status: the `scale_inertia.py` script below was executed against Chapter 1.4's
+`simple_humanoid.urdf` and its output is reproduced as printed, except that the final line names
+whatever output path you pass it. The Gazebo run that consumes the result is pending execution in a
+Gazebo-capable environment.*
+
+Now cause the CAD unit slip deliberately and measure it. This script copies a URDF and multiplies
+one link's six inertia terms by a factor, leaving everything else — mass, geometry, joints, the
+inertial origin — untouched. It uses the same `xml.etree.ElementTree` approach as Chapter 1.4's
+`urdf_tree.py`, so nothing here is new. Save as `scale_inertia.py`:
+
+```python
+"""Copy a URDF, scaling one link's inertia tensor by a factor."""
+
+import sys
+import xml.etree.ElementTree as ET
+
+TENSOR = ('ixx', 'ixy', 'ixz', 'iyy', 'iyz', 'izz')
+
+
+def scale_inertia(in_path, out_path, link_name, factor):
+    tree = ET.parse(in_path)
+    for link in tree.getroot().findall('link'):
+        if link.get('name') != link_name:
+            continue
+        inertia = link.find('inertial/inertia')
+        if inertia is None:
+            raise SystemExit('link %r has no inertia element' % link_name)
+        print('%s, inertia x %g:' % (link_name, factor))
+        for key in TENSOR:
+            scaled = float(inertia.get(key)) * factor
+            inertia.set(key, '%.6g' % scaled)
+            print('  %s = %s' % (key, inertia.get(key)))
+        tree.write(out_path, xml_declaration=True, encoding='utf-8')
+        print('wrote %s' % out_path)
+        return
+    raise SystemExit('no link named %r in %s' % (link_name, in_path))
+
+
+def main(argv):
+    if len(argv) != 5:
+        raise SystemExit('usage: scale_inertia.py IN.urdf OUT.urdf LINK FACTOR')
+    scale_inertia(argv[1], argv[2], argv[3], float(argv[4]))
+
+
+if __name__ == '__main__':
+    main(sys.argv)
+```
+
+Run it on the torso with the factor a millimetre-to-metre slip would give you:
+
+```bash
+python3 scale_inertia.py \
+  ~/humanoid/simple_humanoid.urdf \
+  ~/humanoid/humanoid_cad_units.urdf \
+  torso 1e6
+```
+
+```text
+torso, inertia x 1e+06:
+  ixx = 254800
+  ixy = 0
+  ixz = 0
+  iyy = 208800
+  iyz = 0
+  izz = 110800
+wrote /home/you/humanoid/humanoid_cad_units.urdf
+```
+
+The torso still weighs 12 kg, its box is still 0.18 × 0.28 × 0.42 m, and its centre of mass is still
+`0 0 0.21`. Nothing Chapter 1.4's `urdf_tree.py` reports has changed, and the file is still a valid
+URDF tree — which is exactly why this class of error survives review.
+
+Reset the world (restart `gz sim`), spawn the broken copy, restart `fall_probe.py`, and press Play:
+
+```bash
+ros2 run ros_gz_sim create \
+  -world empty \
+  -file ~/humanoid/humanoid_cad_units.urdf \
+  -name simple_humanoid \
+  -z 0.9
+```
+
+Compare the two settled reports, and reason about what you expect *before* you look — the prediction
+is the exercise. The free-fall phase should be identical, since mass and gravity are untouched and
+inertia plays no part in translation. Everything after the feet make contact must diverge, because
+that is where torques start acting on the torso, and a torso a million times harder to rotate cannot
+participate in the crumple. The head-relative-z deviation is the number that carries that; the
+settle time is the number that shows the fall taking a different shape.
+
+Then try the error the other way, with `1e-6`, and be ready to stop the simulator quickly. A
+near-zero-inertia link driven by ordinary contact impulses is the "model leaves the scene" failure
+from earlier, and `fall_probe.py` reports it as a world z of absurd magnitude rather than as
+anything you could watch.
+
+## Exercises
+
+Each needs the environment above, both Python programs, and Chapter 1.4's `simple_humanoid.urdf`.
+
+**1. Predict a drop before you run it.** Spawn at `-z 1.5` instead of `0.9` and predict, before
+pressing Play, the free-fall duration and impact speed from the 0.85 m sole offset and *g* =
+9.8 m/s². Check both against `fall_probe.py`.
+*Correct result*: 0.65 m of free fall — about 0.36 s and about 3.6 m/s downward, roughly 3.6 times
+the Chapter 2.1 impact speed from a height only 0.6 m greater. Say in one sentence why the settled
+world z should nonetheless be nearly identical in both runs.
+
+**2. Move the mass, and predict the direction.** Adapt `scale_inertia.py` into a script that edits
+the *head* link's `<inertial><origin>` from `0 0 0.12` to `0.15 0 0.12`, leaving mass and tensor
+alone. Recompute the whole-robot centre of mass, then say which way the robot should lean before you
+spawn it.
+*Correct result*: 2.5 kg moving 0.15 m forward shifts the 34.7 kg robot's centre of mass forward by
+2.5 × 0.15 / 34.7 ≈ 0.011 m, so the forward margin shrinks from 0.148 m to about 0.137 m and the
+backward margin grows. The point is that you can predict the *sign and size* from the model alone.
+Say why the fall may nevertheless look unchanged, given failure one.
+
+**3. Read the support polygon off the model.** Without running anything, compute the support polygon
+and tipping angles for a variant with foot boxes of 0.30 × 0.14 m instead of 0.22 × 0.10 m, same
+ankle positions, same `0.04` forward offset, centre of mass still 0.857 m up.
+*Correct result*: x from −0.110 to +0.190 and y from −0.160 to +0.160, giving about 7.4° backwards
+instead of 4.8° and about 10.6° sideways instead of 9.3°. Then say what τ = √(L/g) does in response,
+and why bigger feet therefore buy margin but not time.
+
+**4. Pay for a smaller step.** Save the world below as `physics_lab.sdf`, run
+`gz sim -v 4 physics_lab.sdf`, spawn the humanoid into the world named `physics_lab`, and watch the
+real-time factor in the window and on `gz topic -e -t /world/physics_lab/stats -n 5`. Then set
+`max_step_size` to `0.0001` and repeat.
+
+```xml
+<?xml version="1.0" ?>
+<sdf version="1.10">
+  <world name="physics_lab">
+    <physics name="lab" type="dart">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system"
+            name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system"
+            name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+            name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-contact-system"
+            name="gz::sim::systems::Contact"/>
+    <gravity>0 0 -9.8</gravity>
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>1.0</mu>
+                <mu2>1.0</mu2>
+              </ode>
+            </friction>
+          </surface>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+  </world>
+</sdf>
+```
+
+*Correct result*: the world is now named `physics_lab`, so every topic path moves with it —
+`/world/physics_lab/pose/info`, and `POSE_TOPIC` in `fall_probe.py` must follow, which is itself the
+lesson that world names are not decoration. At 0.0001 s the engine does ten times the work per
+simulated second, so a machine holding real-time factor near 1.0 should fall to roughly 0.1, while
+`fall_probe.py`'s timings — free-fall duration, settle time — should be essentially unchanged,
+because they are measured in *simulated* seconds. Say which run you would use to develop a walking
+controller and which to record a demonstration video.
+
+---
+
+You can now say why the robot on the floor is there: twelve unactuated hinges, and a 34.7 kg mass
+standing 0.857 m above a support polygon 0.072 m deep at the back. Neither is fixable by tuning a
+number. The first needs something applying torque at the joints; the second needs something that
+knows the robot is tilting, well inside that 0.30 s time constant.
+
+Knowing the tilt is a sensing problem, and sensing is what the rest of this module is about.
