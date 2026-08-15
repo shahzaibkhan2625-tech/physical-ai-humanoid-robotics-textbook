@@ -1,0 +1,571 @@
+---
+sidebar_position: 5
+title: "Unity for Robot Visualization"
+---
+
+# Unity for Robot Visualization
+
+[Chapter 2.3](./simulating-sensors.mdx) left the humanoid with three sensors and a node that reads
+all three. Every result in that chapter arrived as a line of text: `lidar 2.903 m at +0.3 deg`.
+That is the right format for the audience it had — you, checking a number against a wall you placed
+at *x* = 3.0 m.
+
+It is the wrong format for a different audience. A safety reviewer asking whether the robot's arm
+sweeps into the walkway, a mechanical engineer who wants to see the visor's field of view, a
+customer being shown what the machine will do in their building: none of them can read
+`lidar 2.903 m at +0.3 deg`, and Gazebo's own viewport — grey boxes on an infinite grey plane — does
+not help them much either.
+
+This chapter is about that second audience, and about the honest accounting of what it costs to
+serve them. Unity is a second renderer bolted onto a simulation that is otherwise unchanged. It
+adds a great deal to what a human can see and **nothing** to what is true.
+
+## Learning objectives
+
+By the end of this chapter you will be able to:
+
+- Decide, for a specific task, whether to reach for Unity or stay with Gazebo — and say what Unity
+  does not replace.
+- Describe how data crosses from ROS 2 into a Unity scene, and why a TCP endpoint sits in the middle
+  rather than Unity speaking ROS 2 directly.
+- Write a `rclpy` node that publishes joint angles for this book's humanoid in a form a Unity scene
+  can render.
+- Name the three conversions that have to happen between a ROS 2 joint angle and a moving Unity
+  robot, and which one silently produces a robot that moves 57 times too far.
+
+## Two audiences for one simulation
+
+Every simulator renders, but not for the same reason.
+
+**Gazebo's viewport exists so that you can debug the physics.** It draws what the engine holds:
+collision shapes when you ask for them, contact points, the joint frames. Chapter 2.3's LiDAR made
+this concrete in an uncomfortable way — physics sees a 0.12 m sphere for the head, the renderer sees
+a 0.11 m skull plus an orange visor, and the two disagree by design. That viewport is an instrument.
+It is not trying to look like anything.
+
+**Unity's renderer exists so that a person believes what they are looking at.** It is a
+general-purpose real-time renderer with the material, lighting, shadow, and post-processing
+machinery of a commercial game engine, plus an asset pipeline for importing furnished rooms,
+warehouse shelving, and human characters. Pointed at a robot simulation, it produces images that a
+non-roboticist can interpret without translation.
+
+Those are different jobs, and the second one is worth naming plainly, because engineers routinely
+undervalue it. Robotics projects are funded, staffed, and cancelled by people who will never run
+`ros2 topic echo`. A ten-second clip of the humanoid standing in a rendered room does more to
+communicate the state of a project than any amount of correct telemetry.
+
+There is a second consumer of good pixels that is not human at all: a perception model trained on
+camera images. What that model learns depends on lighting, materials, reflections, and clutter, so
+rendering fidelity stops being cosmetic and starts being part of the data. That thread is picked up
+in the next module, with a different tool built specifically for it; this chapter stays on the human
+audience.
+
+### What Unity does not replace
+
+Unity ships a physics engine. This book does not use it, and the reason is a rule rather than a
+preference.
+
+**A simulation gets exactly one authority on what is true.** In this book that is Gazebo, and it has
+been since [Chapter 2.1](./gazebo-setup-and-basics.mdx). The masses, inertia tensors, contact
+behaviour, and friction that [Chapter 2.2](./physics-gravity-collisions.mdx) spent a chapter
+justifying are consumed by Gazebo's solver. Unity's solver is a different implementation, tuned for
+different priorities, and it would produce a different fall from the same URDF. Two answers to the
+same question is not redundancy — it is a bug you cannot localise. So Unity's rigid-body simulation
+stays switched off for the robot, and the Unity scene is downstream: it is *told* where the joints
+are, and it never decides.
+
+The same applies to sensors. The `sensor_msgs/msg/LaserScan` your code consumes comes from Gazebo's
+ray casts, because those are the numbers that were checked against a wall at a known distance.
+Rendering the same scene beautifully in Unity does not make a second LiDAR more correct.
+
+So: **Unity renders, Gazebo rules.** Every design decision in this chapter follows from that.
+
+## When it is worth the toolchain, and when it is not
+
+Unity is a multi-gigabyte install, a second description of your robot to keep in step with the URDF,
+a C# codebase, and an extra process on the network. That is a real cost and it is paid continuously,
+not once.
+
+Reach for Unity when **the pixels are the product**:
+
+- Someone outside the robotics team has to see the robot work — a demo, a design review, a
+  stakeholder update, an operator-facing view.
+- The environment itself matters to the question: the robot has to be shown in a furnished room, a
+  shop floor, a hospital corridor. Gazebo can hold such a world, but building and lighting it is
+  Unity's day job and not Gazebo's.
+- You need a camera view that looks like a real camera, for a person to judge.
+
+Stay with Gazebo, and do not install anything, when:
+
+- The question is physical. Does it tip, does the foot slip, is the inertia right. Unity cannot
+  answer these, because it is not the authority.
+- The question is about frames, transforms, or the model's structure. **RViz already does this**, it
+  is already installed, and [Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx) showed you how to
+  drive it. Reaching for Unity to check a TF tree is an expensive way to be slower.
+- The question is about data. `ros2 topic echo`, a plot, or Chapter 2.3's probe node answers it in
+  seconds and leaves a number you can put in a commit message.
+
+The failure mode worth naming: teams install Unity early because it looks impressive, then maintain
+a Unity scene that drifts out of sync with the URDF until nobody trusts it. The scene is not the
+robot. Import it from the URDF, re-import when the URDF changes, and never hand-edit the imported
+hierarchy — that discipline is most of what keeps a Unity scene worth having.
+
+## How data crosses: why there is a TCP endpoint
+
+[Chapter 1.2](../ros2/ros2-architecture.mdx) established that ROS 2 nodes find each other and
+exchange messages over **DDS**, and [Chapter 2.1](./gazebo-setup-and-basics.mdx) established that
+Gazebo Transport is a *different* middleware, which is why a bridge process has to translate between
+them. Unity is a third case, and a harsher one.
+
+A ROS 2 client library — `rclpy` included — is a wrapper over a C library, `rcl`, which sits on top
+of a DDS vendor's implementation, plus generated type-support code for every message type. Making
+Unity a DDS participant would mean carrying all of that inside the Editor's managed C# runtime, on
+every platform Unity targets, and keeping it in step with each ROS 2 release. Unity Robotics did not
+do that.
+
+Instead, the connection is deliberately dumb, and made of two halves:
+
+| Half | Where it runs | What it is |
+|---|---|---|
+| **ROS-TCP-Endpoint** | On the ROS 2 machine | An ordinary ROS 2 Python node. It is a full DDS participant — it subscribes and publishes like any other node — and it relays over a plain TCP socket. |
+| **ROS-TCP-Connector** | Inside Unity | A Unity package: a TCP client, plus generated C# classes for ROS message types. |
+
+Unity therefore never touches DDS. It talks to one ROS 2 node, over one socket, in a private
+protocol. Five consequences follow, and each one is a thing that will confuse you at some point:
+
+**The endpoint is a real node, so ordinary tools see it.** It appears in `ros2 node list`, and
+`ros2 node info` shows every topic Unity asked it to subscribe to. When nothing moves in Unity, this
+is the first place to look, and it splits the problem cleanly in two: if the endpoint is subscribed
+and receiving, the fault is on the Unity side of the socket.
+
+**Nothing happens until the endpoint is running.** Unity connects to a host and port; if there is no
+listener, the scene runs perfectly and stays still. This is the single most common "it doesn't work"
+and it produces no error in ROS 2 at all, because from ROS 2's point of view nothing was ever asked
+for.
+
+**QoS is the endpoint's, not Unity's.** The endpoint node makes the subscription, so the quality-of-
+service profile in play is whatever it chose. Unity does not negotiate with the original publisher.
+Topics that rely on non-default QoS — the latched, `transient_local` `robot_description` from
+Chapter 1.4 is the obvious one — may behave differently than they do for a normal subscriber.
+
+**It is a network link, which is a feature.** Unity and Gazebo both want the GPU, and on one laptop
+they fight. Because the link is TCP, the Unity Editor can run on a different machine from ROS 2
+entirely — a Windows workstation rendering a simulation that is running on a Linux box. You give the
+connector that machine's address instead of `127.0.0.1`. For many readers this is the difference
+between being able to follow this chapter and not.
+
+**One socket means back-pressure.** Everything Unity subscribes to shares a connection. A scene
+rendering at 12 fps will not consume a 100 Hz topic promptly, and the effect is delay, not a tidy
+error. Publish to Unity at a rate a renderer can absorb — tens of hertz, not hundreds — and treat
+the link as a view, never as a control path.
+
+### Importing the humanoid
+
+The robot in a Unity scene should come from `simple_humanoid.urdf` and nowhere else. Unity Robotics
+provides a **URDF Importer** package that reads a URDF and builds the corresponding Unity hierarchy:
+one GameObject per link, parented as the joint tree parents them, with each link's visual geometry
+as a child mesh and an **`ArticulationBody`** component carrying the joint's type, axis, and limits.
+
+Chapter 1.4's humanoid is an unusually easy import, and not by accident: every `<visual>` in it is a
+`<box>`, `<cylinder>`, or `<sphere>`. There are no mesh files, so there are no missing assets, no
+`package://` paths to resolve, and no scale surprises. A production URDF with STL or Collada meshes
+needs those files reachable from the URDF's location before the import will succeed.
+
+Two things about the imported hierarchy matter for everything that follows.
+
+**Unity names GameObjects after links; URDF joints have their own names.** A `JointState` message
+says `r_elbow_joint`, but the object in the Unity scene is called `r_lower_arm`, because that is the
+child link the joint drives. The mapping — joint → its child link — is one you supply. It catches
+everyone once.
+
+**`ArticulationBody` drive targets are in degrees. ROS joint positions are in radians.** Send 1.2
+radians to a drive expecting degrees and the arm moves 1.2 degrees; send a radian value where a
+degree is wanted across the board and the robot moves 57.3 times too little, or too much if you get
+the conversion backwards. This is the conversion referred to in the learning objectives, and it is
+worth expecting before it happens.
+
+There is a third conversion, which the importer handles for you but which you should know exists:
+**ROS and Unity disagree about space.** ROS uses a right-handed, Z-up convention; Unity uses a
+left-handed, Y-up one. Any *pose* crossing the boundary needs converting, and the connector package
+ships helpers for exactly that. Joint *angles* are scalars about an axis the importer already set
+up, which is one reason this chapter's example publishes joint angles rather than poses — it keeps
+the example about the ROS 2 side, which is where the spec puts the focus.
+
+---
+
+## Running it
+
+**None of the code or commands below has been executed by the author**, who wrote this chapter on
+Windows with no ROS 2, no Gazebo, and no Unity install. The Python program was syntax-checked with
+`python -m py_compile`; the ROS-side facts (package layout, launch file name, node name, parameter
+names and defaults) were read from the `main-ros2` branch of the `Unity-Technologies/ROS-TCP-Endpoint`
+repository. **Both examples are pending execution in a Unity-capable environment.** The C# script in
+particular has never been compiled — it is included because a chapter about crossing a boundary that
+shows only one side of it is not much use, and it is deliberately the smallest thing that can move a
+robot.
+
+A further honesty note, and it is the important one: **Unity Robotics' published ROS 2 support names
+Foxy, not Jazzy.** The endpoint is a plain `ament_python` package whose runtime dependency is
+`rclpy`, so building it on Jazzy is a normal source build rather than a port — but it is not a
+combination the vendor tests, and you should expect to read build errors rather than assume none.
+Nothing else in this book has that property; every other tool in Modules 1 and 2 is a supported
+Jazzy pairing.
+
+### Environment
+
+The ROS 2 side is [Chapter 2.1](./gazebo-setup-and-basics.mdx)'s environment, unchanged: ROS 2
+**Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**, with Gazebo **Harmonic** if you want the humanoid
+under physics as well. Source every terminal with `source /opt/ros/jazzy/setup.bash`.
+
+The Unity side is new, and it is heavy:
+
+| What | Notes |
+|---|---|
+| Unity Hub + Unity Editor | Unity Robotics states 2020.2 or later; use a current LTS release. Several gigabytes, plus a Unity account and a licence tier you select at install. |
+| ROS-TCP-Connector | Unity package, installed through the Editor's Package Manager from a git URL. |
+| URDF Importer | Unity package, same route. |
+| ROS-TCP-Endpoint | ROS 2 package, built from source in a colcon workspace. |
+| GPU | A real one. This is a game engine. |
+
+Take the two Unity package git URLs from the `Unity-Technologies/Unity-Robotics-Hub` repository's own
+instructions rather than from this page — they encode a repository subfolder and a release tag, and
+they change between releases. Install them through **Window → Package Manager → Add package from git
+URL**.
+
+Build the endpoint once:
+
+```bash
+mkdir -p ~/unity_ws/src
+cd ~/unity_ws/src
+git clone -b main-ros2 https://github.com/Unity-Technologies/ROS-TCP-Endpoint.git
+cd ~/unity_ws
+colcon build
+source ~/unity_ws/install/setup.bash
+```
+
+The `main-ros2` branch is the ROS 2 one; the default branch of that repository is for ROS 1 and will
+not build here.
+
+### Example 1: publishing joint angles from ROS 2
+
+*Status: pending execution in a Unity-capable environment. Syntax-checked with `python -m
+py_compile`; uses [Chapter 1.3](../ros2/python-agents-rclpy.mdx)'s node skeleton unchanged.*
+
+This is the chapter's real example. It is an ordinary `rclpy` publisher — nothing in it knows Unity
+exists, which is the point. It publishes `sensor_msgs/msg/JointState` on `/joint_states`, the same
+message type and topic that [Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx)'s
+`joint_state_publisher` GUI used to drive RViz. Anything that renders a robot from ROS 2 consumes
+this topic, so a node that publishes it correctly can drive RViz, Unity, or both at once.
+
+The motion is a wave: the right arm lifts, the elbow oscillates, the head turns to follow. Every
+angle is clamped to the limits declared in `simple_humanoid.urdf`, because a renderer will happily
+show you a joint bent past a limit that a physical robot would break on.
+
+Save as `joint_wave.py`:
+
+```python
+"""Publishes a waving pose for simple_humanoid.urdf on /joint_states.
+
+Nothing here is Unity-specific: /joint_states is the standard topic any
+robot renderer consumes, so this drives RViz and a Unity scene equally.
+"""
+
+import math
+
+import rclpy
+from rclpy.node import Node
+
+from sensor_msgs.msg import JointState
+
+# The twelve revolute joints of simple_humanoid.urdf, in URDF order.
+JOINT_NAMES = [
+    'waist_joint',
+    'neck_joint',
+    'l_shoulder_joint',
+    'l_elbow_joint',
+    'r_shoulder_joint',
+    'r_elbow_joint',
+    'l_hip_joint',
+    'l_knee_joint',
+    'l_ankle_joint',
+    'r_hip_joint',
+    'r_knee_joint',
+    'r_ankle_joint',
+]
+
+# lower, upper for the joints this node actually moves, copied from the
+# <limit> elements of simple_humanoid.urdf. Publishing outside these is
+# not an error -- a renderer will draw it -- so the node clamps instead.
+LIMITS = {
+    'neck_joint': (-1.57, 1.57),
+    'r_shoulder_joint': (-2.00, 2.00),
+    'r_elbow_joint': (-2.50, 0.00),
+}
+
+PUBLISH_HZ = 30.0    # a rate a renderer can absorb over one TCP socket
+TOPIC = 'joint_states'
+
+
+def clamp(name, value):
+    low, high = LIMITS[name]
+    return min(max(value, low), high)
+
+
+class JointWave(Node):
+
+    def __init__(self):
+        super().__init__('joint_wave')
+
+        self.declare_parameter('wave_hz', 0.5)
+
+        self.publisher = self.create_publisher(JointState, TOPIC, 10)
+        self.create_timer(1.0 / PUBLISH_HZ, self.on_tick)
+        self.create_timer(1.0, self.on_status)
+
+        self.elapsed = 0.0
+        self.angles = dict.fromkeys(JOINT_NAMES, 0.0)
+        self.sent = 0
+
+        self.get_logger().info('publishing %d joints on %s at %.0f Hz'
+                               % (len(JOINT_NAMES), TOPIC, PUBLISH_HZ))
+
+    def pose_at(self, t):
+        """Joint angles, in radians, for time t seconds into the wave."""
+        wave_hz = self.get_parameter('wave_hz').value
+        phase = 2.0 * math.pi * wave_hz * t
+
+        # Right arm raised and held; elbow swings through most of its
+        # range; head turns slowly to look at the same side.
+        self.angles['r_shoulder_joint'] = clamp('r_shoulder_joint', -1.40)
+        self.angles['r_elbow_joint'] = clamp(
+            'r_elbow_joint', -1.00 + 0.90 * math.sin(phase))
+        self.angles['neck_joint'] = clamp(
+            'neck_joint', -0.40 * math.sin(0.5 * phase))
+        return self.angles
+
+    def on_tick(self):
+        self.elapsed += 1.0 / PUBLISH_HZ
+        angles = self.pose_at(self.elapsed)
+
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = list(JOINT_NAMES)
+        msg.position = [angles[name] for name in JOINT_NAMES]
+        # velocity and effort stay empty: JointState allows it, and a
+        # renderer only needs position.
+
+        self.publisher.publish(msg)
+        self.sent += 1
+
+    def on_status(self):
+        self.get_logger().info(
+            'sent %d | elbow %+.3f rad (%+.1f deg) | neck %+.3f rad'
+            % (self.sent,
+               self.angles['r_elbow_joint'],
+               math.degrees(self.angles['r_elbow_joint']),
+               self.angles['neck_joint']))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = JointWave()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+Check it works before Unity is anywhere in the picture. This is the same three-step discipline
+Chapter 2.1 used for the Gazebo bridge — prove each hop separately, in order:
+
+```bash
+python3 joint_wave.py
+```
+
+```bash
+ros2 topic echo /joint_states --field position
+```
+
+You should see a twelve-element list arriving 30 times a second, with the fifth element pinned at
+`-1.4`, the sixth sweeping between `-1.9` and `-0.1`, and the second drifting slowly through
+±`0.4`. The status line printed once a second gives you the same elbow angle in degrees, which is
+the number to compare against Unity later.
+
+If you want to see it on a robot immediately, and without installing anything: run Chapter 1.4's
+`display_humanoid.launch.py` with its `joint_state_publisher` node removed, and this node drives
+RViz directly. That is a useful sanity check and a fair reminder of the cheaper option.
+
+### Example 2: the smallest Unity side that moves
+
+*Status: **never compiled**. C#, and outside the environments available to the author. Included as
+the minimum needed to see Example 1 work.*
+
+Start the endpoint on the ROS 2 machine:
+
+```bash
+ros2 launch ros_tcp_endpoint endpoint.py
+```
+
+That starts a node called `UnityEndpoint`. It takes two parameters, `ROS_IP` (default `0.0.0.0`,
+meaning it accepts connections on any interface) and `ROS_TCP_PORT` (default `10000`). Confirm it
+came up:
+
+```bash
+ros2 node list
+```
+
+In Unity: import `simple_humanoid.urdf` with the URDF Importer, set the connector's ROS IP address
+and port to match the endpoint (`127.0.0.1` and `10000` if both are on one machine), and attach the
+script below to the imported robot's root object.
+
+```csharp
+using System.Collections.Generic;
+using UnityEngine;
+using Unity.Robotics.ROSTCPConnector;
+using RosMessageTypes.Sensor;
+
+// Drives three joints of the imported simple_humanoid from /joint_states.
+public class JointStateReceiver : MonoBehaviour
+{
+    public string topicName = "/joint_states";
+
+    // URDF names joints; the URDF Importer names GameObjects after links,
+    // and puts the ArticulationBody on the joint's CHILD link. So the
+    // mapping from a JointState name to a Unity object is joint -> child.
+    static readonly Dictionary<string, string> JointToLink =
+        new Dictionary<string, string>
+        {
+            { "neck_joint",       "head" },
+            { "r_shoulder_joint", "r_upper_arm" },
+            { "r_elbow_joint",    "r_lower_arm" }
+        };
+
+    readonly Dictionary<string, ArticulationBody> bodies =
+        new Dictionary<string, ArticulationBody>();
+
+    // Written by the message callback, read by Update. Targets are kept
+    // in DEGREES, because that is what ArticulationDrive expects.
+    readonly Dictionary<string, float> targetsDeg =
+        new Dictionary<string, float>();
+
+    void Start()
+    {
+        foreach (var body in GetComponentsInChildren<ArticulationBody>())
+        {
+            foreach (var pair in JointToLink)
+            {
+                if (body.name == pair.Value)
+                {
+                    bodies[pair.Key] = body;
+                }
+            }
+        }
+        Debug.Log("JointStateReceiver: matched " + bodies.Count + " of "
+                  + JointToLink.Count + " joints");
+
+        ROSConnection.GetOrCreateInstance()
+                     .Subscribe<JointStateMsg>(topicName, OnJointState);
+    }
+
+    void OnJointState(JointStateMsg msg)
+    {
+        for (int i = 0; i < msg.name.Length && i < msg.position.Length; i++)
+        {
+            if (bodies.ContainsKey(msg.name[i]))
+            {
+                // ROS sends radians. Unity drives want degrees.
+                targetsDeg[msg.name[i]] = (float)msg.position[i]
+                                          * Mathf.Rad2Deg;
+            }
+        }
+    }
+
+    // Apply in Update so the scene is only ever touched from Unity's own
+    // frame loop, whatever thread the message arrived on.
+    void Update()
+    {
+        foreach (var pair in bodies)
+        {
+            float target;
+            if (!targetsDeg.TryGetValue(pair.Key, out target))
+            {
+                continue;
+            }
+            var drive = pair.Value.xDrive;
+            drive.target = target;
+            pair.Value.xDrive = drive;
+        }
+    }
+}
+```
+
+Press Play in Unity with `joint_wave.py` running, and the robot's right elbow should swing at the
+rate the node's `wave_hz` parameter sets while the head turns at half that rate.
+
+**When it does nothing, diagnose in this order** — the same order as the topic list:
+
+1. `ros2 topic echo /joint_states` — is the data on the wire at all? If not, the fault is Example 1
+   and Unity is innocent.
+2. `ros2 node list` — is `UnityEndpoint` there? If not, nothing Unity does can work.
+3. `ros2 node info /UnityEndpoint` — does it list `/joint_states` as a subscription? If not, Unity
+   never connected, or connected to the wrong address.
+4. The Unity console's `matched N of 3 joints` line. `matched 0 of 3` means the script is on the
+   wrong object, or the imported link names differ from the ones in the table.
+5. Only now suspect the drive: if the joint moves but in the wrong direction, that is a sign, and if
+   it barely moves at all, that is the radians-and-degrees conversion.
+
+That ordering is worth more than the script. Each step splits the system in half and rules out one
+side, and the boundary this chapter is about is exactly where beginners lose an afternoon.
+
+## Exercises
+
+The first exercise needs only the ROS 2 environment. The rest need Unity as well.
+
+**1. Prove the publisher without Unity.** Run `joint_wave.py`, then use `ros2 topic hz
+/joint_states` and `ros2 topic echo /joint_states --field name` while changing `wave_hz` at runtime
+with `ros2 param set /joint_wave wave_hz 2.0`.
+*Correct result*: an average rate near 30 Hz that does **not** change when you change `wave_hz` —
+`wave_hz` sets how fast the arm swings, not how often it is reported — and a twelve-element name
+list in URDF order. Then set `wave_hz` to `0.0` and say what the elbow angle settles to and why it
+is not zero.
+
+**2. Break the clamp deliberately.** Change the elbow term from `-1.00 + 0.90 * math.sin(phase)` to
+`-1.00 + 3.00 * math.sin(phase)` and watch the published value, then remove the `clamp` call for
+that joint and watch it again.
+*Correct result*: with the clamp, the value flattens at `-2.500` and `0.000` for part of each cycle
+— the URDF's declared elbow limits — giving a visible pause at each end of the swing. Without it,
+values of `+2.0` and `-4.0` are published and the renderer draws them. Say what this tells you about
+where joint limits are enforced, and which of the tools in this module would have refused the same
+angle.
+
+**3. Make the joint-to-link mapping fail on purpose.** Change `"r_elbow_joint"` in the C# table to
+map to `"r_upper_arm"` instead of `"r_lower_arm"`, and predict what you will see before you press
+Play.
+*Correct result*: `matched 3 of 3` — nothing reports an error, because both link names exist — and
+the shoulder now receives the elbow's angle while the elbow receives nothing and holds still. Two
+joints wrong from one edit. Say why this class of mistake produces no diagnostic anywhere in the
+system, and what you would add to `Start()` to catch it.
+
+**4. Decide, in writing, for four tasks.** For each of the following, say Unity or Gazebo or RViz,
+and give the one-sentence reason: (a) checking whether the humanoid's arm reaches into a doorway in
+a modelled office; (b) checking whether the humanoid tips over when its right foot's friction is
+halved; (c) checking that the depth camera from Chapter 2.3 is mounted facing forward and not
+backward; (d) producing a thirty-second clip for a funding review.
+*Correct result*: (a) Unity — the environment and how it reads to a human are the question;
+(b) Gazebo — it is a physics question and Gazebo is the authority; (c) RViz — it is a frame
+question, it is already installed, and Chapter 1.4 showed you how; (d) Unity — the pixels are
+literally the product. If you answered Unity to (b), reread "What Unity does not replace".
+
+---
+
+That closes the digital twin. The humanoid now has a body that physics tests, sensors that report
+what a real robot's would report, and — when it is worth the toolchain — a view a person outside the
+project can understand.
+
+What it still does not have is any opinion of its own. Nothing in this module decides anything: the
+fall in Chapter 2.2 was gravity, the readings in Chapter 2.3 were measurements, and the wave in this
+chapter was a sine function you wrote. Turning sensor data into an estimate of where the robot is,
+and that estimate into a decision about where to go, is the next module's subject.
