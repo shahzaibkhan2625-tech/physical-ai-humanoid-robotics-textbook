@@ -1,0 +1,446 @@
+---
+sidebar_position: 2
+title: "Isaac Sim & Synthetic Data"
+---
+
+# Isaac Sim & Synthetic Data
+
+[Chapter 1.1](../ros2/physical-ai-embodied-intelligence.mdx) named the sim-to-real gap and said, in
+passing, that domain randomization is the best-known way to manage it, and that "later in this book
+you will generate exactly that kind of randomised data." This chapter is where that promise is kept.
+
+**This chapter needs an NVIDIA RTX-class GPU**, as [Module 3's landing page](./index.mdx) already
+said. Isaac Sim and the Replicator toolkit it ships with are built on GPU-accelerated rendering and
+physics; there is no CPU fallback. The theory below does not depend on that hardware — you can read
+every idea here and understand what synthetic data is for without running anything. The code in
+*Running it* does depend on it, and this chapter says exactly which parts, and marks them
+accordingly, rather than pretending otherwise.
+
+## Learning objectives
+
+By the end of this chapter you will be able to:
+
+- Explain how Isaac Sim differs from Gazebo *in purpose*, not just in which buttons it has.
+- Explain why perception models are starved of labelled data, and what synthetic data does about it.
+- Explain domain randomization: what it perturbs, what it holds fixed, and why that combination
+  works.
+- Generate a small labelled synthetic dataset from a scene containing the humanoid — with the
+  required hardware — and inspect the resulting images and labels from Python.
+- State the sim-to-real gap for a perception model honestly, including what domain randomization
+  does and does not close.
+
+## Why a second simulator
+
+[Module 2](../digital-twin/index.mdx) gave the humanoid a physics engine and three sensors, and by
+the end of it the robot produced sensor data of the same *shape* a real robot's would: distances in
+a frame, a depth image in metres, a gravity vector. What it did not produce was very much of it, or
+any of it labelled. Gazebo answered "does this robot fall over" and "what does this LiDAR beam
+return"; it was never built to answer "generate ten thousand images of a robot from different
+angles, in different light, each one already knowing where the robot is in the frame."
+
+Isaac Sim is NVIDIA's answer to that second question. It is built on Omniverse, NVIDIA's USD-based
+platform for GPU-accelerated rendering and simulation, and it takes the same PhysX engine
+Gazebo can optionally use and pairs it with a renderer designed to produce images close enough to a
+camera's output that a vision model trained on them has a chance of working on the real thing. The
+purpose is different from Gazebo's, not just the implementation: Gazebo optimizes for being a fast,
+open, physically faithful sandbox to test *behaviour* against; Isaac Sim optimizes for producing the
+volume and photorealism of data a perception model needs to *learn* from, at a scale no one could
+hand-label.
+
+[Chapter 2.4](../digital-twin/unity-visualization.mdx) drew a distinction between two audiences for
+a simulation: Gazebo's viewport exists to debug physics, Unity's exists so a human who is not a
+roboticist can look at the robot. Isaac Sim's synthetic-data workflow is for a third audience that
+is not a person at all — a training pipeline that consumes images and labels by the thousand and
+never looks at a single frame with its own eyes. That audience does not care whether a scene is
+pretty. It cares whether the *label* attached to every pixel is correct, at a volume no annotator
+could produce by hand.
+
+None of this replaces Gazebo. A question about whether the humanoid's ankle limit is respected while
+it falls is still a Gazebo question — Isaac Sim's synthetic-data pipeline has no opinion about joint
+limits or contact forces, and this chapter does not ask it one. The two tools solve different
+problems for the same robot.
+
+## The problem synthetic data solves
+
+A supervised perception model — an object detector, a segmentation network, anything that learns to
+read an image — needs a large set of images with the correct answer already attached: "this
+rectangle of pixels is a chair," "this pixel belongs to the floor." Collecting that from the real
+world is slow in a way that compounds. Someone has to capture the image, and then someone — usually
+a different, paid someone — has to draw the box or paint the mask by hand, one image at a time. A
+dataset a vision model can actually learn from is tens of thousands of images at minimum, and the
+scenarios that matter most for a robot — dim light, an object half hidden behind another, an
+unusual camera angle — are exactly the ones that are rarest to capture and slowest to label
+correctly.
+
+Synthetic data attacks the labelling half of that problem, not the labelling accuracy half — because
+it removes the need to label at all. [Chapter 2.3](../digital-twin/simulating-sensors.mdx) made a
+version of this argument for sensor readings: only in simulation do you know the real answer, because
+the wall is at *x* = 3.0 m because you put it there. The same argument applies to a bounding box with
+more force. A simulator that renders a scene already knows, exactly and for free, where every object
+in it is — it placed each one. Ask it for a bounding box around the humanoid and it does not
+estimate one; it reads back the boundary of the pixels it just decided to colour that way. There is
+no annotator, no disagreement between two people boxing the same edge slightly differently, and no
+cost per image once the scene is built. The price paid for that free label is the one
+[Chapter 2.3](../digital-twin/simulating-sensors.mdx) already named for sensors: a simulated scene is
+thinner than the world, and a model trained only on it has never seen anything the simulator did not
+think to render.
+
+## Domain randomization, and why it works
+
+Rendering the humanoid once and generating ten thousand identical images of it does not fix
+anything — it produces ten thousand copies of one label, and a model trained on them learns that
+one lighting setup, one camera angle, one floor colour, as if those were part of what makes a
+humanoid a humanoid. Swap the light bulb in the real room and the model breaks, because it was never
+shown that a humanoid stays a humanoid under a different light.
+
+**Domain randomization** is the fix: vary everything about the scene that is *not* the thing being
+labelled, aggressively and on every rendered frame, while keeping the object's identity and its
+label fixed. Light direction, intensity and colour; camera position and angle; the floor and
+background; the presence of distractor objects nearby — all of it changes from frame to frame. The
+one constant across every frame is that the humanoid is still a humanoid, wherever it appears in the
+image. [Tobin et al. (2017)](https://arxiv.org/abs/1703.06907), the paper
+[Chapter 1.1](../ros2/physical-ai-embodied-intelligence.mdx) already named, demonstrated this for
+transferring an object-detection model from simulation to a real robot, and the mechanism is worth
+stating plainly: a model minimising its training error across images that disagree about everything
+except the object's shape and identity can only reduce that error by learning features tied to shape
+and identity. It cannot cheat by keying on lighting or background colour, because those are exactly
+the variables that keep changing under it. The randomization does not make the images more realistic
+— several of them will look nothing like a real photograph. It makes the *variation* wide enough
+that whatever a real camera happens to show, in whatever light, looks like just another sample from
+a distribution the model has already been trained to be indifferent to.
+
+Two things domain randomization does not promise, stated before the code makes them concrete. It
+does not guarantee the randomized range actually contains real-world conditions — a light intensity
+range chosen too narrow still leaves the model naive about a darker room than any it trained on.
+And it says nothing about *dynamics or contact*, the physics side of the sim-to-real gap
+[Chapter 1.1](../ros2/physical-ai-embodied-intelligence.mdx) introduced; domain randomization as
+covered here is a technique for the *appearance* half of that gap, the one a camera experiences, not
+the half a foot experiences when it hits the ground.
+
+## Bringing the humanoid into Isaac Sim
+
+[Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx) made the case that three different consumers
+— visualization, physics, kinematics — read one URDF file so they cannot disagree about the robot.
+Isaac Sim is a fourth consumer, and it does not read URDF directly: Omniverse's native format is
+**USD** (Universal Scene Description), so the same masses, joints, limits and collision geometry
+that [Chapter 2.1](../digital-twin/gazebo-setup-and-basics.mdx) fed into Gazebo's SDF conversion get
+fed, once, through Isaac Sim's URDF importer into a USD version of `simple_humanoid.urdf`. Nothing
+about the robot changes in that step — the thirteen links and twelve joints from Chapter 1.4 are
+still the whole model — only the file format the next tool reads it as does.
+
+The same caution [Chapter 2.3](../digital-twin/simulating-sensors.mdx) raised about the SDF
+conversion applies here in its own form: a converter is free software making choices about anything
+the source format left ambiguous, and the safest habit is the one that chapter already taught —
+check what the imported model actually contains rather than assume the conversion was lossless.
+This chapter does not walk through the importer's menu itself: exactly how you invoke it changes
+between Isaac Sim releases, USD authoring is its own subject this chapter is not trying to teach, and
+the interesting part for a synthetic-data pipeline is not the import step but what happens once the
+robot is a USD prim sitting in a scene Replicator can see. From that point on, the humanoid is an
+object like any other in the scene: give it a semantic label, and every frame Replicator renders
+comes with an exact answer for where that label's pixels are.
+
+## The sim-to-real gap, for a model instead of a controller
+
+State this one honestly, because it is easy to read "domain randomization" as a solution rather than
+a mitigation. Even a heavily randomized synthetic image is not statistically identical to a real
+camera frame. Real sensor noise has structure a rendering engine's noise model does not reproduce
+exactly — [Chapter 2.3](../digital-twin/simulating-sensors.mdx) said as much about Gazebo's noise
+models, and Isaac Sim's are better, not infallible. Real scenes have clutter, wear, and lighting
+combinations no randomization range was told to include. Compression artifacts from a real camera's
+pipeline are not modelled at all. A model trained purely on synthetic data, however well
+randomized, is making a bet that the variation it saw during training was wide enough to cover
+whatever a real camera shows it — and that bet is not guaranteed to pay off.
+
+This is why, in practice, synthetic data is a component of a training pipeline rather than the whole
+of it — typically mixed with, or followed by fine-tuning on, some real labelled data, so the model
+sees the real distribution at least once. Actually building and training that model is not this
+chapter's job; the catalog scopes this chapter to producing the dataset, not training on it. What
+this chapter owes you is the honest half of the trade: synthetic data solves the *cost* of getting
+labelled images at scale, and domain randomization narrows, without closing, the *gap* between what
+those images teach a model and what a real camera will show it.
+
+## Running it
+
+### Environment
+
+**Isaac Sim** paired with **Isaac ROS `release-4.5`**, on **ROS 2 Jazzy Jalisco** /
+**Ubuntu 24.04 (Noble)**, and an **NVIDIA GPU of the Ampere architecture or newer** with **8 GB or
+more of VRAM**, **CUDA 13.0 or newer**, and **driver 580 or newer** — the same requirements
+[Module 3's landing page](./index.mdx) lists, restated here because this chapter is where they
+first bind. Isaac Sim ships its own bundled Python interpreter, invoked as `./python.sh` from the
+Isaac Sim install directory; that interpreter, not your system Python, is what `omni.replicator.core`
+and `isaacsim` import from.
+
+**Neither example below has been run.** The development environment used to write this book is
+Windows with no NVIDIA GPU, so nothing that imports `isaacsim` or `omni.replicator.core` could be
+executed here. Example 1 is checked for Python syntax only (`python -m py_compile`) — it has not
+been run against Isaac Sim, and is marked `blocked`, environment required: an NVIDIA RTX-class GPU
+running Isaac Sim. Example 2 needs no such hardware — it is plain Python against files on disk — and
+*was* executed, against a small hand-built dataset matching Example 1's output layout, exactly so
+its logic could be checked before this chapter shipped it. That distinction is stated again after
+each example, not just here.
+
+### Example 1: generating the dataset
+
+This assumes `humanoid.usd` already exists beside the script — the USD form of
+`simple_humanoid.urdf`, produced once by Isaac Sim's URDF importer as described above. A camera is
+placed looking at the robot, a light and the camera's own position are re-randomized before every
+frame, and each frame's bounding box around the humanoid is read back from Replicator's own
+annotator and written out as JSON — in a schema this chapter defines itself, rather than depending on
+the exact on-disk format a bundled writer happens to use, which has changed between Isaac Sim
+releases.
+
+**Status: `blocked`. Environment required: `nvidia-rtx-gpu` running Isaac Sim (Isaac ROS
+`release-4.5` line). Checked for Python syntax only (`python -m py_compile`); not executed.**
+
+```python
+"""Generate a small labelled synthetic dataset of the humanoid, with domain
+randomization over lighting and camera pose, using Isaac Sim's Replicator.
+
+Run inside Isaac Sim's own Python, from an Isaac Sim install directory:
+
+    ./python.sh generate_dataset.py
+
+Environment: Isaac Sim paired with Isaac ROS release-4.5, Ubuntu 24.04, an
+NVIDIA RTX-class GPU (Ampere or newer, 8 GB+ VRAM, CUDA 13.0+, driver 580+).
+Assumes humanoid.usd already exists next to this file: the USD form of
+Chapter 1.4's simple_humanoid.urdf, produced once with Isaac Sim's URDF
+importer.
+"""
+
+import json
+import os
+
+from isaacsim import SimulationApp
+
+simulation_app = SimulationApp({"headless": True})
+
+import omni.replicator.core as rep  # noqa: E402  (Isaac Sim must init first)
+
+HUMANOID_USD = os.path.join(os.path.dirname(__file__), "humanoid.usd")
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "humanoid_dataset")
+NUM_FRAMES = 25
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# The humanoid, labelled so any annotator that touches it can name it.
+humanoid = rep.create.from_usd(HUMANOID_USD, semantics=[("class", "humanoid")])
+
+# A plain floor, labelled too, so a frame with no humanoid in view still has
+# something to report rather than an empty box list.
+floor = rep.create.plane(scale=10, semantics=[("class", "floor")])
+
+camera = rep.create.camera(position=(2.5, 0, 1.2), look_at=(0, 0, 0.8))
+render_product = rep.create.render_product(camera, (640, 480))
+
+# rgb is written by the built-in writer; the bounding box is pulled from its
+# own annotator and written in our own JSON schema below, so the label
+# format on disk is exactly what dataset_inspect.py expects.
+writer = rep.WriterRegistry.get("BasicWriter")
+writer.initialize(output_dir=OUTPUT_DIR, rgb=True)
+writer.attach([render_product])
+
+bbox_annotator = rep.AnnotatorRegistry.get_annotator("bounding_box_2d_tight_fast")
+bbox_annotator.attach([render_product])
+
+
+def randomize_lighting():
+    rep.create.light(
+        light_type="distant",
+        rotation=rep.distribution.uniform((-90, -180, 0), (-10, 180, 0)),
+        intensity=rep.distribution.uniform(500, 3000),
+        color=rep.distribution.uniform((0.6, 0.6, 0.6), (1.0, 1.0, 1.0)),
+    )
+
+
+def randomize_camera():
+    with camera:
+        rep.modify.pose(
+            position=rep.distribution.uniform((1.8, -1.5, 0.8), (3.2, 1.5, 1.8)),
+            look_at=(0, 0, 0.8),
+        )
+
+
+for frame in range(NUM_FRAMES):
+    randomize_lighting()
+    randomize_camera()
+    rep.orchestrator.step()
+
+    boxes = bbox_annotator.get_data()
+    frame_boxes = [
+        {
+            "semantic_id": int(row["semanticId"]),
+            "x_min": float(row["x_min"]),
+            "y_min": float(row["y_min"]),
+            "x_max": float(row["x_max"]),
+            "y_max": float(row["y_max"]),
+        }
+        for row in boxes["data"]
+    ]
+    label_path = os.path.join(OUTPUT_DIR, "labels_%04d.json" % frame)
+    with open(label_path, "w") as handle:
+        json.dump(
+            {"id_to_labels": boxes["info"]["idToLabels"], "boxes": frame_boxes},
+            handle,
+            indent=2,
+        )
+
+simulation_app.close()
+```
+
+Run to completion, this would leave `humanoid_dataset/` holding 25 `rgb_0000.png` … `rgb_0024.png`
+images from `BasicWriter`, and a `labels_0000.json` … `labels_0024.json` beside each one, written by
+the loop above — no two frames with the same light direction, intensity, or camera position, and
+every one of the 25 labels exact, because Replicator read the humanoid's own bounding box off the
+scene it had just rendered.
+
+### Example 2: inspecting the dataset from Python
+
+The catalog's code example asks for inspection "from Python," and that half needs nothing Isaac Sim
+provides: once the dataset exists as files, reading a PNG's dimensions and a JSON label file is a
+standard-library problem. This script reports one line per frame — the image's size, how many boxes
+it has, and which classes appear — and a summary at the end, without any third-party image library.
+
+**Status: executed and passing.** Run against a small hand-built mock dataset that follows Example
+1's exact output layout — four frames, three with one `humanoid` box each and one with none, and one
+frame with its `rgb` file present and its label file deliberately missing, to exercise that branch.
+This checks the script's logic; it is not a real Isaac Sim run, since none was available to produce
+one.
+
+```python
+"""Inspect a synthetic dataset produced by generate_dataset.py -- no Isaac Sim
+required, standard library only.
+
+Usage: python dataset_inspect.py [path-to-humanoid_dataset]
+"""
+
+import glob
+import json
+import os
+import struct
+import sys
+
+
+def read_png_size(path):
+    """Return (width, height) read directly from a PNG's IHDR chunk."""
+    with open(path, 'rb') as handle:
+        signature = handle.read(8)
+        if signature != b'\x89PNG\r\n\x1a\n':
+            raise ValueError('%s is not a PNG file' % path)
+        handle.read(4)  # chunk length, always 13 for IHDR
+        chunk_type = handle.read(4)
+        if chunk_type != b'IHDR':
+            raise ValueError('%s has no leading IHDR chunk' % path)
+        width, height = struct.unpack('>II', handle.read(8))
+    return width, height
+
+
+def main():
+    dataset_dir = sys.argv[1] if len(sys.argv) > 1 else 'humanoid_dataset'
+
+    images = sorted(glob.glob(os.path.join(dataset_dir, 'rgb_*.png')))
+    if not images:
+        print('no images found in %s' % dataset_dir)
+        return 1
+
+    seen_classes = set()
+    empty_frames = 0
+
+    for image_path in images:
+        frame_id = os.path.splitext(os.path.basename(image_path))[0].split('_')[1]
+        label_path = os.path.join(dataset_dir, 'labels_%s.json' % frame_id)
+
+        width, height = read_png_size(image_path)
+
+        if not os.path.exists(label_path):
+            print('%s: %dx%d, NO LABEL FILE' % (os.path.basename(image_path), width, height))
+            continue
+
+        with open(label_path) as handle:
+            labels = json.load(handle)
+
+        id_to_labels = labels['id_to_labels']
+        boxes = labels['boxes']
+        if not boxes:
+            empty_frames += 1
+
+        classes = sorted({id_to_labels.get(str(box['semantic_id']), '?') for box in boxes})
+        seen_classes.update(classes)
+
+        print('%s: %dx%d, %d box(es), classes %s'
+              % (os.path.basename(image_path), width, height, len(boxes), classes))
+
+    print()
+    print('frames:        %d' % len(images))
+    print('empty frames:  %d' % empty_frames)
+    print('classes seen:  %s' % sorted(seen_classes))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+```
+
+Against the mock dataset described above, this prints:
+
+```text
+rgb_0000.png: 64x48, 1 box(es), classes ['humanoid']
+rgb_0001.png: 64x48, 1 box(es), classes ['humanoid']
+rgb_0002.png: 64x48, 0 box(es), classes []
+rgb_0003.png: 64x48, NO LABEL FILE
+
+frames:        4
+empty frames:  1
+classes seen:  ['humanoid']
+```
+
+Run against a real `humanoid_dataset/` from Example 1, the same script would report 25 frames at
+`640x480`, with `classes seen` reading `['humanoid']` on every frame the camera randomizer kept the
+floor out of view, and `['floor', 'humanoid']` on the rest, since the floor was labelled too. An
+`empty frames` count above zero there would mean the camera randomizer's range let the camera point
+somewhere the humanoid never appears — worth noticing, because a training set with empty labels in
+it is not obviously wrong until a model trained on it does something strange.
+
+## Exercises
+
+**1. Build a mock dataset and inspect it — no GPU required.** Write a short script that creates a
+`mock_dataset/` folder with three `rgb_0000.png`–`rgb_0002.png` files (any small PNG-writing
+approach will do, including a hand-built one like Example 2's own test fixture) and matching
+`labels_0000.json`–`labels_0002.json` files in Example 2's schema, with at least one frame holding
+zero boxes. Run `dataset_inspect.py` against it.
+*Correct result*: one summary line per image, an accurate `empty frames` count, and a `classes seen`
+list containing exactly the classes you wrote into the label files — if any of those three disagree
+with what you built, the bug is in your mock data, not the inspector.
+
+**2. Decide what stays fixed.** From the theory above, name two visual properties of the *humanoid
+itself* that Example 1's randomizers never touch — everything they vary is about the light and the
+camera, not the robot's own appearance.
+*Correct result*: the robot's own material colour and geometry are constant across every frame; only
+its position in the *image* changes, driven by the camera. Say what a model trained only on this
+dataset risks if a real robot of the same design were ever repainted or scuffed, and which of this
+chapter's randomizers you would extend to cover that.
+
+**3. Isaac Sim or Gazebo — decide, in writing, for two tasks.** (a) Checking whether the humanoid's
+knee joint respects its `<limit>` while the robot falls, the way
+[Chapter 2.2](../digital-twin/physics-gravity-collisions.mdx) did. (b) Producing ten thousand
+labelled images of the humanoid for a perception model, each with an exact bounding box.
+*Correct result*: (a) Gazebo — it is a physics-fidelity and joint-limit question, and Chapter 2.2
+already answered it there; Isaac Sim's Replicator pipeline has no opinion about contact forces.
+(b) Isaac Sim — scale and exact, free labels are exactly what this chapter's pipeline is for, and
+Gazebo has no equivalent tool. If you picked Isaac Sim for (a), reread "Why a second simulator."
+
+**4. Predict what happens with the randomizers turned off.** Reread `randomize_lighting` and
+`randomize_camera`, and suppose both were deleted so every frame used the same fixed light and
+camera position from `render_product`'s creation.
+*Correct result*: the dataset would still have exact labels — Replicator still knows exactly where
+the humanoid is — but every image would look nearly identical, and a model trained on it would have
+learned to recognise one specific rendered scene rather than a humanoid under varying conditions.
+Say which of this chapter's two problems — the labelling-cost problem or the sim-to-real gap — that
+change would make worse, and which it would leave untouched.
+
+---
+
+The dataset this chapter produces has exact labels and a training pipeline that will happily consume
+them; it has no idea where the robot *is* right now, or which way it is facing relative to anything
+around it. Answering "where am I" from a camera stream — visual SLAM, and what NVIDIA's
+GPU-accelerated implementation of it needs and produces — is the next chapter's subject.

@@ -1,0 +1,84 @@
+---
+sidebar_position: 1
+title: "Module 3 — NVIDIA Isaac: The AI-Robot Brain"
+---
+
+# Module 3 — NVIDIA Isaac: The AI-Robot Brain
+
+[Module 2](../digital-twin/index.mdx) closed with a robot that has a body physics tests and senses
+that report data of the right shape, and nothing else. "Turning sensor data into an estimate of
+where the robot is, and that estimate into a decision about where to go" was left as the next
+module's subject. This is that module.
+
+One requirement before anything else, because it changes what you can do with this module and not
+just how fast: **the chapters here target NVIDIA Isaac, and Isaac Sim and Isaac ROS both require an
+NVIDIA RTX-class GPU.** There is no software substitute — Isaac ROS's perception packages are built
+on CUDA and will not run on a CPU-only machine or a non-NVIDIA GPU. Every chapter states this again
+in its own opening, but it belongs here first: decide whether you have that hardware before you
+read expecting to run anything, not after.
+
+**The robot does not change here either.** Every chapter in this module still works with the
+humanoid from [Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx) — the same thirteen links,
+the same twelve revolute joints. Isaac does not need a different model; it needs the same one
+placed in a different simulator, and later, wired to a different stack of software.
+
+## What this module covers
+
+**Isaac Sim & Synthetic Data**, this module's first chapter, is about a problem every perception
+model has before it can be trained at all: it needs thousands of labelled images, and nobody wants
+to hand-label them. Isaac Sim generates that data by rendering scenes it already knows the ground
+truth for, and domain randomization is the technique that keeps the model from overfitting to one
+rendered look. You bring the humanoid into Isaac Sim and generate a small labelled dataset from a
+scene containing it.
+
+The next two chapters continue the perception-to-decision chain that this module's outcome names,
+and are not part of this drafting pass. **Isaac ROS & Visual SLAM** takes up the question a robot
+must answer before anything else — where it is — using the camera stream as input and a pose
+estimate as output. **Nav2: Path Planning for Bipeds** turns that pose estimate, plus a goal, into
+a path, and confronts what changes when the robot walks on two feet instead of rolling on wheels.
+
+## What you need first
+
+**Background.** All of [Module 1](../ros2/index.mdx) and [Module 2](../digital-twin/index.mdx).
+This module assumes you can read a URDF, write an `rclpy` node, and explain why a simulator is not
+the world — all established there and not repeated here.
+
+**Software.** Isaac Sim and Isaac ROS are both built around one platform pairing:
+
+| Component | Version |
+|---|---|
+| ROS 2 | Jazzy Jalisco |
+| Operating system | Ubuntu 24.04 LTS (Noble Numbat) |
+| Isaac ROS | the `release-4.5` line |
+| CUDA | 13.0 or newer |
+| NVIDIA driver | 580 or newer |
+
+Isaac ROS's own documentation states these as its tested requirements for this ROS 2 distribution;
+because NVIDIA ships new Isaac releases frequently, treat `release-4.5` as the line this module
+targets rather than a version frozen forever, and re-check it against
+[`nvidia-isaac-ros.github.io`](https://nvidia-isaac-ros.github.io/) before you install anything.
+
+**Hardware.** This is the requirement stated at the top of this page, restated as a checklist:
+
+- An **NVIDIA GPU of the Ampere architecture or newer** — the generation that introduced the
+  RT and Tensor core capabilities Isaac ROS's packages are built against.
+- **8 GB or more of GPU memory.**
+- **32 GB or more of free disk**, for the Isaac Sim and Isaac ROS container images and assets.
+- A **CUDA-capable driver at version 580 or newer** installed on the host.
+
+If you do not have this hardware, every chapter in this module is still worth reading. Each one is
+written so that the theory — what the problem is, why the tool exists, how it works — stands on its
+own. The code and commands will not run for you, and each chapter says so plainly rather than
+pretending otherwise; treat those sections as a description of what running them would show.
+
+## What you will be able to do at the end
+
+- Explain what synthetic data is for, why domain randomization matters, and produce a small
+  labelled dataset from a simulated scene — with the required hardware.
+- Explain what visual SLAM consumes and produces, and name conditions under which it fails.
+- Explain what Nav2 needs before it can plan a path, and describe at least one reason a
+  wheeled-robot navigation stack is not enough for a biped.
+
+A reader who finishes this module — with or without the GPU it asks for — can explain the
+perception and navigation stack that lets a robot know where it is and decide how to get somewhere.
+A reader with the hardware can also run it.
