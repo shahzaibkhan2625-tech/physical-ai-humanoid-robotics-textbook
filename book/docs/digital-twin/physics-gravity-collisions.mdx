@@ -326,7 +326,8 @@ sudo apt install ros-jazzy-ros-gz
 Source every terminal with `source /opt/ros/jazzy/setup.bash`. You need `simple_humanoid.urdf` from
 [Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx) at `~/humanoid/simple_humanoid.urdf`, and you
 need to be comfortable with the spawn-and-bridge sequence from Chapter 2.1, which is used here
-unchanged.
+unchanged. The one message package the first example imports, `tf2_msgs`, arrives as a dependency of
+`ros_gz_bridge`, so the install line above covers it.
 
 ### Example 1: measuring the fall instead of watching it
 
@@ -403,7 +404,7 @@ HEAD = 'head'
 
 HEAD_REST_Z = 0.490      # m above base_link with every joint at zero
 SPAWN_Z = 0.9            # m, the -z given to ros_gz_sim create
-REPORT_PERIOD = 0.5      # s of sim time between report lines
+REPORT_PERIOD = 0.5      # s of wall time between report lines
 SETTLE_WINDOW = 1.0      # s of sim time the height must stay still
 SETTLE_TOLERANCE = 0.002  # m
 
@@ -424,7 +425,15 @@ class FallProbe(Node):
         super().__init__('fall_probe')
 
         self.create_subscription(TFMessage, POSE_TOPIC, self.on_poses, 10)
-        self.create_timer(REPORT_PERIOD, self.on_report)
+
+        # The times this node *reports* come from message stamps, so they are
+        # simulated seconds. The timer deciding when to print must not, or it
+        # would freeze with the world and the probe would fall silent exactly
+        # when you most want to hear from it.
+        self.wall_clock = rclpy.clock.Clock(
+            clock_type=rclpy.clock.ClockType.STEADY_TIME)
+        self.create_timer(REPORT_PERIOD, self.on_report,
+                          clock=self.wall_clock)
 
         self.t_zero = None
         self.t_now = 0.0
@@ -484,7 +493,10 @@ class FallProbe(Node):
     def check_settled(self, t):
         if self.settled_at is not None or len(self.history) < 2:
             return
-        if t - self.history[0][0] < SETTLE_WINDOW:
+        # The pop loop above leaves the span at most SETTLE_WINDOW, so compare
+        # with a little slack: demanding exactly 1.0 s of accumulated float
+        # stamps would be a coin toss.
+        if t - self.history[0][0] < SETTLE_WINDOW - 1e-6:
             return
 
         heights = [h for _, h in self.history]
@@ -546,16 +558,25 @@ ros2 run ros_gz_sim create \
 ```bash
 ros2 run ros_gz_bridge parameter_bridge \
   /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock \
-  /world/empty/pose/info@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V
+  /world/empty/model/simple_humanoid/pose@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V
 ```
 
 ```bash
 python3 fall_probe.py --ros-args -p use_sim_time:=true
 ```
 
-`use_sim_time:=true` matters more here than in Chapter 2.1: every time in this node's output is
-simulated time taken from message stamps, and a 0.5 s report timer reading the wall clock would
-sample a paused world.
+`use_sim_time:=true` does less here than it did in Chapter 2.1, and the difference is worth naming
+rather than glossing. Chapter 2.1's node printed `self.get_clock().now()`, so the parameter visibly
+changed its output. This node never reads its own clock at all: every time it reports comes from the
+stamps the pose publisher writes into each pose, and the report timer is deliberately given a steady
+wall clock — a timer on simulated time stops when simulated time stops, and a probe that goes silent
+while the world is paused cannot tell you it is waiting for you to press Play. The parameter is kept
+so this node's clock agrees with the rest of your graph, not because anything you see depends on it.
+
+One thing it does not do, in this node or any other: the bracketed timestamp at the head of each log
+line is system time regardless. `rcutils` reads the system clock directly when it formats a log
+message, and no ROS parameter redirects it. Simulated seconds appear in this node's output only
+where the node puts them there itself.
 
 Now press **Play** and read the numbers.
 
@@ -577,11 +598,6 @@ Gazebo → ROS 2 with `[`, and a bidirectional `@` would make ROS 2 a publisher 
 topic.
 
 ### Example 2: breaking the inertia tensor on purpose
-
-*Status: the `scale_inertia.py` script below was executed against Chapter 1.4's
-`simple_humanoid.urdf` and its output is reproduced as printed, except that the final line names
-whatever output path you pass it. The Gazebo run that consumes the result is pending execution in a
-Gazebo-capable environment.*
 
 Now cause the CAD unit slip deliberately and measure it. This script copies a URDF and multiplies
 one link's six inertia terms by a factor, leaving everything else — mass, geometry, joints, the
@@ -629,9 +645,10 @@ if __name__ == '__main__':
 Run it on the torso with the factor a millimetre-to-metre slip would give you:
 
 ```bash
+cd ~/humanoid
 python3 scale_inertia.py \
-  ~/humanoid/simple_humanoid.urdf \
-  ~/humanoid/humanoid_cad_units.urdf \
+  simple_humanoid.urdf \
+  humanoid_cad_units.urdf \
   torso 1e6
 ```
 
@@ -643,7 +660,7 @@ torso, inertia x 1e+06:
   iyy = 208800
   iyz = 0
   izz = 110800
-wrote /home/you/humanoid/humanoid_cad_units.urdf
+wrote humanoid_cad_units.urdf
 ```
 
 The torso still weighs 12 kg, its box is still 0.18 × 0.28 × 0.42 m, and its centre of mass is still
@@ -706,9 +723,9 @@ real-time factor in the window and on `gz topic -e -t /world/physics_lab/stats -
 
 ```xml
 <?xml version="1.0" ?>
-<sdf version="1.10">
+<sdf version="1.11">
   <world name="physics_lab">
-    <physics name="lab" type="dart">
+    <physics name="lab" type="ignored">
       <max_step_size>0.001</max_step_size>
       <real_time_factor>1.0</real_time_factor>
     </physics>
@@ -761,9 +778,10 @@ real-time factor in the window and on `gz topic -e -t /world/physics_lab/stats -
 </sdf>
 ```
 
-*Correct result*: the world is now named `physics_lab`, so every topic path moves with it —
-`/world/physics_lab/pose/info`, and `POSE_TOPIC` in `fall_probe.py` must follow, which is itself the
-lesson that world names are not decoration. At 0.0001 s the engine does ten times the work per
+*Correct result*: the world is now named `physics_lab`, so every topic path moves with it — the pose
+publisher's topic becomes `/world/physics_lab/model/simple_humanoid/pose`, and both the bridge
+argument and `POSE_TOPIC` in `fall_probe.py` must follow, which is itself the lesson that world
+names are not decoration. At 0.0001 s the engine does ten times the work per
 simulated second, so a machine holding real-time factor near 1.0 should fall to roughly 0.1, while
 `fall_probe.py`'s timings — free-fall duration, settle time — should be essentially unchanged,
 because they are measured in *simulated* seconds. Say which run you would use to develop a walking
