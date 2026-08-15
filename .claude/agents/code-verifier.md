@@ -3,7 +3,7 @@ name: code-verifier
 description: Independently verifies the code examples in a textbook chapter — Python syntax, real vs invented rclpy/ROS 2 APIs, correctness for ROS 2 Jazzy (not Lyrical-only idioms), imports, and whether the stated environment matches the code. Use after a chapter is drafted, and before it is considered done. Reports findings only; never edits.
 tools: Read, Glob, Grep, WebFetch, WebSearch, Bash, PowerShell
 skills: chapter-authoring
-model: inherit
+model: opus
 color: orange
 ---
 

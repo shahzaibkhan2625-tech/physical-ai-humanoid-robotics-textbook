@@ -3,7 +3,7 @@ name: chapter-writer
 description: Writes or revises one chapter of the Physical AI & Humanoid Robotics textbook by applying the chapter-authoring skill. Use when a specific chapter needs drafting or rewriting. Authoring only — it does not review its own output; run code-verifier and consistency-checker afterwards.
 tools: Read, Write, Edit, Glob, Grep, WebFetch, WebSearch, Bash, PowerShell
 skills: chapter-authoring
-model: inherit
+model: sonnet
 color: blue
 ---
 

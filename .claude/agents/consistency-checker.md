@@ -2,7 +2,7 @@
 name: consistency-checker
 description: Checks one textbook chapter against the rest of the book — chapter shape, terminology consistency, cross-links instead of re-teaching, no forward references, the single humanoid model, and scope agreement with the Chapter Catalog. Use after a chapter is drafted, alongside code-verifier. Reports findings only; never edits.
 tools: Read, Glob, Grep
-model: inherit
+model: opus
 color: purple
 ---
 
