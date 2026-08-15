@@ -228,9 +228,25 @@ author what they intended.
 
 ### Non-Functional Requirements
 
-- **NFR-001**: Depth is moderate, leaning light. A chapter is a single sitting: roughly 1,200–2,500
-  words of prose excluding code, targeting 15–25 minutes of reading. A chapter materially over
-  this budget must be split (see Edge Cases).
+- **NFR-001**: Depth is moderate, leaning light. A chapter is a single sitting, and the prose
+  budget excluding code depends on how much toolchain the chapter must carry:
+
+  | Scope | Prose budget | Reading time |
+  |---|---|---|
+  | Module 1 (ROS 2 fundamentals) | 1,200–2,500 words | 15–25 min |
+  | Modules 2–4 (toolchain-heavy) | 1,200–4,500 words | 15–40 min |
+
+  A chapter materially over its band must be split (see Edge Cases).
+
+  **Rationale for the Modules 2–4 band** (widened at the Module 2 review, T017a): Module 1
+  chapters teach concepts against a single toolchain the reader already has installed. From
+  Module 2 on, a chapter must additionally stand up and explain an entire external toolchain —
+  Gazebo Harmonic plus `ros_gz` in Module 2, Isaac in Module 3 — before it can teach anything,
+  and that setup material is load-bearing rather than padding. All four Module 2 chapters landed
+  at 3,300–4,200 words. Cutting them to the original band was considered and rejected: the
+  material is not redundant, and splitting would change FR-004's chapter count and the catalog.
+  The band is widened rather than the chapters cut. NFR-002 (no padding) still governs — this
+  buys room for necessary setup, not for hedging or repetition.
 - **NFR-002**: Tone is clear, direct, and teaching-oriented. No marketing language, no hedging,
   no padding.
 - **NFR-003**: The book MUST assume no prior robotics knowledge and MUST NOT re-teach Python
@@ -488,8 +504,9 @@ can assemble the whole book into one working system.
 - **SC-004**: 100% of chapters state the environment and versions their examples assume.
 - **SC-005**: Every chapter's learning objectives match its "reader can afterwards" entry in this
   catalog — no chapter promises less or drifts elsewhere.
-- **SC-006**: A reader with the stated background can complete any single chapter in 15–25
-  minutes of reading, and prose length falls within the NFR-001 band.
+- **SC-006**: A reader with the stated background can complete any single chapter in one sitting
+  — 15–25 minutes for Module 1, 15–40 minutes for Modules 2–4 — and prose length falls within
+  that chapter's NFR-001 band.
 - **SC-007**: 100% of chapters end with 2–4 exercises answerable from material already taught.
 - **SC-008**: Zero broken internal links; the site builds with no errors or warnings introduced
   by this content.

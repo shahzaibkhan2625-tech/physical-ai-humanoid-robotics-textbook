@@ -56,9 +56,10 @@ assumes. Every internal link resolves to a file that exists.
 **9. Out-of-bounds references (FR-020).** The chapter must not refer to the chatbot, deployment,
 personalization, or translation as things that exist.
 
-**10. Depth and audience (Principle I).** Roughly 1,200–2,500 words of prose excluding code.
-Report the actual count. Flag re-teaching of Python basics, and flag assumed robotics knowledge
-the book has not provided.
+**10. Depth and audience (Principle I).** Prose excluding code, per NFR-001: roughly
+1,200–2,500 words for Module 1 chapters, 1,200–4,500 for Modules 2–4, which must stand up an
+external toolchain before they can teach. Report the actual count against the band that applies.
+Flag re-teaching of Python basics, and flag assumed robotics knowledge the book has not provided.
 
 **11. Motivation before mechanism (Principle IV).** Theory explains why the mechanism exists
 before how to use it. A sequence of steps with no stated reason is a finding.

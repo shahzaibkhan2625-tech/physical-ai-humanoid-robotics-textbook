@@ -35,8 +35,9 @@ Jazzy environment as the content gate; `code-verifier` and `consistency-checker`
 **Target Platform**: Reader runs Ubuntu 24.04 (Noble). Book renders as a static site.
 **Project Type**: Documentation/content — single Docusaurus site, no application code
 **Performance Goals**: Not applicable to content. Site build stays green and fast enough for CI.
-**Constraints**: Chapter prose 1,200–2,500 words (NFR-001); every example runnable as printed
-(Principle II); every robotics claim verified against official docs (Principle III)
+**Constraints**: Chapter prose 1,200–2,500 words in Module 1, 1,200–4,500 in Modules 2–4
+(NFR-001); every example runnable as printed (Principle II); every robotics claim verified
+against official docs (Principle III)
 **Scale/Scope**: 4 modules, 14 chapters, 4 module landing pages, 1 introduction page,
 4 `_category_.json` files — 23 content artifacts
 
@@ -46,7 +47,7 @@ Jazzy environment as the content gate; `code-verifier` and `consistency-checker`
 
 | Principle | Gate | Status |
 |---|---|---|
-| I. Learner-First Depth | Chapters assume Python, not robotics; 1,200–2,500 words; split rather than expand | ✅ Enforced by `chapter-authoring` Step 7 and `consistency-checker` check 10 |
+| I. Learner-First Depth | Chapters assume Python, not robotics; 1,200–2,500 words (Module 1) / 1,200–4,500 (Modules 2–4); split rather than expand | ✅ Enforced by `chapter-authoring` Step 7 and `consistency-checker` check 10 |
 | II. Runnable Code Only | Every example real, complete, runnable; Python/`rclpy`; environment stated | ⚠️ **Conditional** — see Complexity Tracking. Cannot be met on this machine; plan defines how |
 | III. Verified Technical Accuracy | Claims checked against official docs; versions named | ✅ Target confirmed (spec Assumption 2); source table in the skill; `code-verifier` re-checks independently |
 | IV. Teach the Why | Motivation before mechanism | ✅ `chapter-authoring` Step 3; `consistency-checker` check 11 |
@@ -93,7 +94,7 @@ book/
 │   │   ├── gazebo-setup-and-basics.mdx
 │   │   ├── physics-gravity-collisions.mdx
 │   │   ├── simulating-sensors.mdx
-│   │   └── unity-for-visualization.mdx
+│   │   └── unity-visualization.mdx
 │   ├── isaac/                          # Module 3 — _category_.json position: 4
 │   │   ├── index.mdx
 │   │   ├── isaac-sim-synthetic-data.mdx

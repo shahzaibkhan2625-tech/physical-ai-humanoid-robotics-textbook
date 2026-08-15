@@ -81,7 +81,7 @@ The atomic unit. Exactly 14, fixed by the Chapter Catalog (FR-004).
 | theory | section | part 2 of 4; motivation before mechanism |
 | code example(s) | section | part 3 of 4; 1–2 examples |
 | exercises | section | part 4 of 4; 2–4 exercises |
-| prose length | int | 1,200–2,500 words excluding code (NFR-001) |
+| prose length | int | excluding code: 1,200–2,500 words in Module 1, 1,200–4,500 in Modules 2–4 (NFR-001) |
 | execution state | enum | `drafted` \| `verified` (plan D5) |
 
 **Rules**

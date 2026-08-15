@@ -17,9 +17,11 @@ including the discovery that a robot which is legal URDF is not necessarily a ro
 
 **The robot does not change.** Every chapter here loads the humanoid from
 [Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx) — the same thirteen links and twelve revolute
-joints, the same file. This module introduces no new robot, and none of the later modules do
-either. Where a chapter needs the robot to have something it lacks, it adds to that file rather
-than replacing it.
+joints. This module introduces no new robot, and none of the later modules do either. Where a
+chapter needs the robot to have a capability it lacks — sensors, say — it works on a named copy
+derived from `simple_humanoid.urdf` rather than editing it in place, so that the original stays the
+reference and you can always see what was added by diffing the two. The model is extended; it is
+never replaced.
 
 ## What this module covers
 
@@ -27,12 +29,14 @@ than replacing it.
 a model, and spawns the humanoid into an empty world. Most of the chapter is about one thing that
 trips up everyone: Gazebo and ROS 2 are two separate messaging systems, and a bridge process has to
 translate between them. You finish by writing a Python node that proves, from the ROS 2 side, that
-the two are actually talking.
+the two are actually talking — and, on the way, by pressing Play and watching the humanoid collapse
+the moment its feet touch the ground.
 
 **Physics, Gravity & Collisions** is about what the engine computes on each of those steps. Mass,
 centre of mass, and the inertia tensor; contact detection and friction; and the step size, which
-buys accuracy with wall-clock time. It is also where the humanoid falls over, and where you learn to
-read the fall as information about the model rather than as a bug in the simulator.
+buys accuracy with wall-clock time. It is where you find out *why* the humanoid fell over in the
+previous chapter, and where you learn to read the fall as information about the model rather than as
+a bug in the simulator.
 
 **Simulating Sensors: LiDAR, Depth Cameras, IMU** hangs perception on the body. Each sensor is
 attached to a specific link, produces a specific ROS 2 message type in a specific frame, and lies in
@@ -76,9 +80,14 @@ Linux with working OpenGL drivers.** It renders through OGRE 2, and on a machine
 acceleration — a bare virtual machine with software rendering, a container with no GPU passthrough,
 a remote shell with no display — the GUI will be unusably slow or will refuse to start. If that is
 your situation you can still run the simulation server headless with `gz sim -s` and inspect it
-entirely from the command line and from Python, which is how every verification step in this module
-is written; you simply will not see the robot. Unity's requirements in the last chapter are heavier
-still, and that chapter restates them.
+entirely from the command line and from Python; you simply will not see the robot.
+
+Know the limit of that route before you install anything, because it is not total. Headless covers
+Chapters 2.1 and 2.2 in full, and covers the IMU in Chapter 2.3. It does **not** cover Chapter 2.3's
+other two sensors: the LiDAR and the depth camera are rendered through OGRE 2 on the graphics
+hardware, so without working GPU rendering they will be slow or silent, and that chapter says so in
+its opening. Unity's requirements in the last chapter are heavier still, and that chapter restates
+them too.
 
 ## What you will be able to do at the end
 

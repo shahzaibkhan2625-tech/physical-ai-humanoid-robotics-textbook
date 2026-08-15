@@ -147,7 +147,7 @@ publishing sensor topics, verified by inspecting those topics.
       solve balance control — the catalog lists it as out of scope
 - [ ] T016 [US2] Chapter 2.3 → `book/docs/digital-twin/simulating-sensors.mdx`
       (`sidebar_position: 4`). **Draft + build green.** Sensor fusion belongs to Module 3
-- [ ] T017 [US2] Chapter 2.4 → `book/docs/digital-twin/unity-for-visualization.mdx`
+- [ ] T017 [US2] Chapter 2.4 → `book/docs/digital-twin/unity-visualization.mdx`
       (`sidebar_position: 5`). **Draft + build green.** Python side is the focus; C# only as far
       as needed to see it work
 - [ ] T017a [US2] **Module 2 review** — after T014–T017 are all drafted. Launch `code-verifier`
@@ -320,7 +320,7 @@ them.
 Task: "Use chapter-writer to draft Chapter 2.1 → book/docs/digital-twin/gazebo-setup-and-basics.mdx"
 Task: "Use chapter-writer to draft Chapter 2.2 → book/docs/digital-twin/physics-gravity-collisions.mdx"
 Task: "Use chapter-writer to draft Chapter 2.3 → book/docs/digital-twin/simulating-sensors.mdx"
-Task: "Use chapter-writer to draft Chapter 2.4 → book/docs/digital-twin/unity-for-visualization.mdx"
+Task: "Use chapter-writer to draft Chapter 2.4 → book/docs/digital-twin/unity-visualization.mdx"
 
 # Module review task (T017a) — both reviewers launched together in one message
 Task: "Use code-verifier on all chapters in book/docs/digital-twin/"

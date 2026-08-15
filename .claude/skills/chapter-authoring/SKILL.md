@@ -183,8 +183,17 @@ the divergence.
 
 ## Step 7 — Depth
 
-Moderate, leaning light. Roughly **1,200–2,500 words of prose** excluding code; 15–25 minutes of
-reading. This is a review signal, not a hard gate.
+Moderate, leaning light. The prose budget excluding code depends on how much toolchain the
+chapter must stand up before it can teach (NFR-001):
+
+| Scope | Prose budget | Reading time |
+|---|---|---|
+| Module 1 (ROS 2 fundamentals) | **1,200–2,500 words** | 15–25 min |
+| Modules 2–4 (toolchain-heavy) | **1,200–4,500 words** | 15–40 min |
+
+This is a review signal, not a hard gate. The wider band for Modules 2–4 buys room for the
+setup material a chapter genuinely needs — Gazebo and `ros_gz`, Isaac — and not for hedging or
+repetition, which Step 8's tone rules still forbid.
 
 The reader knows Python and nothing about robotics. Do not re-teach Python. Do not assume ROS,
 simulation, or control theory.

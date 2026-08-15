@@ -143,10 +143,13 @@ listener, the scene runs perfectly and stays still. This is the single most comm
 and it produces no error in ROS 2 at all, because from ROS 2's point of view nothing was ever asked
 for.
 
-**QoS is the endpoint's, not Unity's.** The endpoint node makes the subscription, so the quality-of-
-service profile in play is whatever it chose. Unity does not negotiate with the original publisher.
-Topics that rely on non-default QoS — the latched, `transient_local` `robot_description` from
-Chapter 1.4 is the obvious one — may behave differently than they do for a normal subscriber.
+**QoS is the endpoint's, not Unity's.** The endpoint node makes the subscription, so the
+quality-of-service profile in play is whatever it chose, and Unity never negotiates with the
+original publisher. [Chapter 1.2](../ros2/ros2-architecture.mdx) named quality of service and left
+it at the default queue depth of 10, which is the right choice everywhere else in this book; this
+is the one place it can bite you. A topic whose publisher relies on a non-default profile can work
+for every subscriber you write and still behave differently in Unity, and there is nothing on the
+Unity side to inspect, because the subscription is not Unity's.
 
 **It is a network link, which is a feature.** Unity and Gazebo both want the GPU, and on one laptop
 they fight. Because the link is TCP, the Unity Editor can run on a different machine from ROS 2
@@ -175,8 +178,12 @@ Two things about the imported hierarchy matter for everything that follows.
 
 **Unity names GameObjects after links; URDF joints have their own names.** A `JointState` message
 says `r_elbow_joint`, but the object in the Unity scene is called `r_lower_arm`, because that is the
-child link the joint drives. The mapping — joint → its child link — is one you supply. It catches
-everyone once.
+child link the joint drives. The importer does record the mapping: alongside the `ArticulationBody`
+it attaches a `UrdfJoint` component to the child-link object, with a `jointName` field set from the
+URDF joint's name, so a script can recover joint → child link at runtime. This chapter's script
+writes the three entries out by hand anyway, because a table you can read is a better teaching
+object than a lookup you have to trust. Either way the two names are different strings, and that
+catches everyone once.
 
 **`ArticulationBody` drive targets are in degrees. ROS joint positions are in radians.** Send 1.2
 radians to a drive expecting degrees and the arm moves 1.2 degrees; send a radian value where a
@@ -195,27 +202,19 @@ the example about the ROS 2 side, which is where the spec puts the focus.
 
 ## Running it
 
-**None of the code or commands below has been executed by the author**, who wrote this chapter on
-Windows with no ROS 2, no Gazebo, and no Unity install. The Python program was syntax-checked with
-`python -m py_compile`; the ROS-side facts (package layout, launch file name, node name, parameter
-names and defaults) were read from the `main-ros2` branch of the `Unity-Technologies/ROS-TCP-Endpoint`
-repository. **Both examples are pending execution in a Unity-capable environment.** The C# script in
-particular has never been compiled — it is included because a chapter about crossing a boundary that
-shows only one side of it is not much use, and it is deliberately the smallest thing that can move a
-robot.
-
-A further honesty note, and it is the important one: **Unity Robotics' published ROS 2 support names
-Foxy, not Jazzy.** The endpoint is a plain `ament_python` package whose runtime dependency is
-`rclpy`, so building it on Jazzy is a normal source build rather than a port — but it is not a
-combination the vendor tests, and you should expect to read build errors rather than assume none.
-Nothing else in this book has that property; every other tool in Modules 1 and 2 is a supported
-Jazzy pairing.
-
 ### Environment
 
 The ROS 2 side is [Chapter 2.1](./gazebo-setup-and-basics.mdx)'s environment, unchanged: ROS 2
 **Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**, with Gazebo **Harmonic** if you want the humanoid
-under physics as well. Source every terminal with `source /opt/ros/jazzy/setup.bash`.
+under physics as well. Terminals in this chapter are sourced twice — `/opt/ros/jazzy/setup.bash`
+as always, and then the workspace built below, which is what makes `ros2 launch ros_tcp_endpoint`
+resolve. The next section explains why there is a second one.
+
+One version caveat, and it is the important one: **Unity Robotics' published ROS 2 support names
+Foxy, not Jazzy.** The endpoint is a plain `ament_python` package whose only runtime dependency is
+`rclpy`, so building it on Jazzy is an ordinary source build rather than a port — but Jazzy is not a
+combination the vendor tests, so expect to read build errors rather than assume none. Nothing else
+in this book has that property; every other tool in Modules 1 and 2 is a supported Jazzy pairing.
 
 The Unity side is new, and it is heavy:
 
@@ -225,6 +224,7 @@ The Unity side is new, and it is heavy:
 | ROS-TCP-Connector | Unity package, installed through the Editor's Package Manager from a git URL. |
 | URDF Importer | Unity package, same route. |
 | ROS-TCP-Endpoint | ROS 2 package, built from source in a colcon workspace. |
+| `python3-colcon-common-extensions` | `sudo apt install python3-colcon-common-extensions`. ROS 2's build tool. It is not pulled in by `ros-jazzy-ros-gz`, and this is the first chapter in the book that needs it. |
 | GPU | A real one. This is a game engine. |
 
 Take the two Unity package git URLs from the `Unity-Technologies/Unity-Robotics-Hub` repository's own
@@ -232,30 +232,46 @@ instructions rather than from this page — they encode a repository subfolder a
 they change between releases. Install them through **Window → Package Manager → Add package from git
 URL**.
 
-Build the endpoint once:
+### Building the endpoint: the book's first workspace
+
+Every Python program so far in this book has been a file you ran with `python3`, against packages
+that `apt` had already installed under `/opt/ros/jazzy`. [Chapter 1.2](../ros2/ros2-architecture.mdx)
+said so explicitly. That stops here, for one reason: `ros_tcp_endpoint` is not published as a Debian
+package, so the only way to get it is to compile it from source.
+
+The mechanism is worth three sentences, because you will meet it constantly outside this book. A
+**colcon workspace** is nothing more than a directory with a `src/` subdirectory full of ROS 2
+package sources; `colcon build` compiles every package it finds there and writes the result into a
+sibling `install/` tree. Sourcing that `install/setup.bash` **in addition to**
+`/opt/ros/jazzy/setup.bash` — an *overlay* on top of the system installation — is what puts the new
+package on the search path, and therefore what makes `ros2 launch ros_tcp_endpoint endpoint.py`
+resolve to something. Skip the second `source` and that command fails with a package-not-found
+error, which is the single most common way to get stuck on this page.
+
+Build it once:
 
 ```bash
 mkdir -p ~/unity_ws/src
 cd ~/unity_ws/src
 git clone -b main-ros2 https://github.com/Unity-Technologies/ROS-TCP-Endpoint.git
 cd ~/unity_ws
+source /opt/ros/jazzy/setup.bash
 colcon build
 source ~/unity_ws/install/setup.bash
 ```
 
 The `main-ros2` branch is the ROS 2 one; the default branch of that repository is for ROS 1 and will
-not build here.
+not build here. Every *new* terminal from now on needs both `source` lines, in that order.
 
 ### Example 1: publishing joint angles from ROS 2
 
-*Status: pending execution in a Unity-capable environment. Syntax-checked with `python -m
-py_compile`; uses [Chapter 1.3](../ros2/python-agents-rclpy.mdx)'s node skeleton unchanged.*
-
-This is the chapter's real example. It is an ordinary `rclpy` publisher — nothing in it knows Unity
-exists, which is the point. It publishes `sensor_msgs/msg/JointState` on `/joint_states`, the same
-message type and topic that [Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx)'s
-`joint_state_publisher` GUI used to drive RViz. Anything that renders a robot from ROS 2 consumes
-this topic, so a node that publishes it correctly can drive RViz, Unity, or both at once.
+This is the chapter's real example, and it needs no workspace: it is an ordinary `rclpy` publisher
+on [Chapter 1.3](../ros2/python-agents-rclpy.mdx)'s node skeleton, run with `python3`, and nothing
+in it knows Unity exists — which is the point. It publishes `sensor_msgs/msg/JointState` on
+`/joint_states`, the same message type and topic that
+[Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx)'s `joint_state_publisher_gui` used to drive
+RViz. Anything that renders a robot from ROS 2 consumes this topic, so a node that publishes it
+correctly can drive RViz, Unity, or both at once.
 
 The motion is a wave: the right arm lifts, the elbow oscillates, the head turns to follow. Every
 angle is clamped to the limits declared in `simple_humanoid.urdf`, because a renderer will happily
@@ -395,17 +411,17 @@ You should see a twelve-element list arriving 30 times a second, with the fifth 
 the number to compare against Unity later.
 
 If you want to see it on a robot immediately, and without installing anything: run Chapter 1.4's
-`display_humanoid.launch.py` with its `joint_state_publisher` node removed, and this node drives
+`display_humanoid.launch.py` with its `joint_state_publisher_gui` node removed, and this node drives
 RViz directly. That is a useful sanity check and a fair reminder of the cheaper option.
 
 ### Example 2: the smallest Unity side that moves
 
-*Status: **never compiled**. C#, and outside the environments available to the author. Included as
-the minimum needed to see Example 1 work.*
-
-Start the endpoint on the ROS 2 machine:
+Start the endpoint on the ROS 2 machine, in a terminal with both `source` lines — this is the
+command the overlay exists for:
 
 ```bash
+source /opt/ros/jazzy/setup.bash
+source ~/unity_ws/install/setup.bash
 ros2 launch ros_tcp_endpoint endpoint.py
 ```
 
@@ -545,9 +561,13 @@ angle.
 map to `"r_upper_arm"` instead of `"r_lower_arm"`, and predict what you will see before you press
 Play.
 *Correct result*: `matched 3 of 3` — nothing reports an error, because both link names exist — and
-the shoulder now receives the elbow's angle while the elbow receives nothing and holds still. Two
-joints wrong from one edit. Say why this class of mistake produces no diagnostic anywhere in the
-system, and what you would add to `Start()` to catch it.
+the lower arm now receives nothing and holds still while the upper arm swings with the elbow's
+angle. Two joints wrong from one edit. Expect that second half rather than count on it: both table
+entries now point at the *same* `ArticulationBody`, so `Update()` writes its `xDrive.target` twice
+each frame and whichever write lands last wins. C# does not guarantee `Dictionary` enumeration
+order; .NET returns insertion order in practice when nothing has been removed, which puts the elbow
+last. Say why this class of mistake produces no diagnostic anywhere in the system, and what you
+would add to `Start()` to catch it.
 
 **4. Decide, in writing, for four tasks.** For each of the following, say Unity or Gazebo or RViz,
 and give the one-sentence reason: (a) checking whether the humanoid's arm reaches into a doorway in

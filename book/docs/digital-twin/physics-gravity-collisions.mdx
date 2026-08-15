@@ -65,9 +65,9 @@ Three quantities, easy to blur together, that do different jobs in stage 4.
 under gravity it is pulled down by 34.7 × 9.8 = **340 N**, and 340 N is what its two feet have to
 push back with to hold it up.
 
-**The inertia tensor** is the rotational counterpart: how hard the link is to *spin up* about each
-axis. [Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx) introduced the six numbers and the box
-and sphere formulas they came from. Until now they have been XML. In stage 4 they become the matrix
+**The inertia tensor** is the rotational counterpart, defined in
+[Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx) along with the box and sphere formulas its six
+numbers came from. Until now they have been XML. In stage 4 they become the matrix
 the solver inverts to turn a torque into an angular acceleration, and that is the whole reason a
 wrong one is catastrophic rather than merely inaccurate — the tensor is not a value the engine
 reports back to you, it is a value the engine *divides by*.
@@ -111,7 +111,11 @@ The rule this gives you is the diagnostic habit the rest of the module depends o
 
 ## Gravity
 
-Gravity is a property of the world, not of the robot. In `empty.sdf` it is one line:
+Gravity is a property of the world, not of the robot — and if you search Gazebo's shipped
+`empty.sdf` for it you will not find it. That world file says nothing about gravity, so it takes the
+default: SDFormat 1.11, the specification version Gazebo Harmonic speaks, declares `gravity` as an
+element of `<world>` with the value `0 0 -9.8`. To use anything else you add the element yourself,
+as a child of `<world>`:
 
 ```xml
 <gravity>0 0 -9.8</gravity>
@@ -198,9 +202,9 @@ Chapter 1.4 gave `l_knee_joint` an `effort="100.0"`. It is easy to read that as 
 In URDF, `effort` is a *limit* — a ceiling on what an actuator may command, a statement about a
 motor that might exist. It commands nothing.
 
-Chapter 2.1 already told you the mechanical reason this stays true in simulation: the URDF carries
-no `<gazebo>` tags, so no Gazebo system attaches to the model, so nothing is driving any joint. In
-stage 4 the knee constraint says only *these two links stay connected and rotate about this axis*.
+Chapter 2.1 already told you the mechanical reason this stays true in simulation: driving a joint in
+Gazebo is a system plugin's job, and nothing in the model asks for such a plugin, so nothing is
+driving any joint. In stage 4 the knee constraint says only *these two links stay connected and rotate about this axis*.
 It says nothing about which angle. A joint with no actuator, no damping and no friction is a
 frictionless hinge, and thirteen links on twelve frictionless hinges is not a robot standing up. It
 is a chain, and a chain under gravity finds the floor.
@@ -246,7 +250,8 @@ That number is the whole problem. It is not that the robot is badly built; it is
 roughly two thirds of a second to notice an error and correct it, and the window shrinks as the
 error grows. Every "balance" technique you will meet later — measuring the tilt, moving the centre
 of pressure inside the foot, taking a step to put the support polygon back under the falling mass —
-is an answer to that arithmetic.
+is an answer to that arithmetic. (The **centre of pressure** is the single point at which the
+ground's whole push on a foot can be treated as acting.)
 
 Note that both terms in τ are things you can read off the model. Lower the centre of mass and τ
 grows and balancing gets easier, which is why so many real robots carry their batteries in the
@@ -266,11 +271,15 @@ change.
 One number in the world file governs everything above:
 
 ```xml
-<physics name="default" type="dart">
+<physics name="default" type="ignored">
   <max_step_size>0.001</max_step_size>
   <real_time_factor>1.0</real_time_factor>
 </physics>
 ```
+
+The `type` attribute looks like it picks the engine. It does not — gz-sim never reads it, and the
+engine comes from `--physics-engine` or `GZ_SIM_PHYSICS_ENGINE_PATH` as above. Gazebo's own shipped
+worlds write `type="ignored"` to say exactly that, and this chapter follows them.
 
 `max_step_size` is the slice of simulated time each step advances, in seconds; Gazebo's shipped
 worlds default to 1 ms. Three pressures act on it in different directions.
@@ -304,15 +313,6 @@ and `0` removes the cap — what you want for headless data generation, not for 
 
 ## Running it
 
-**None of the commands or programs below have been executed by the author**, who wrote this chapter
-on Windows with no ROS 2, no Gazebo, and no OpenGL-capable Linux graphics stack. Message types, SDF
-element names, and command-line flags were checked against the official Gazebo Harmonic
-documentation and the SDFormat specification, and both Python programs were syntax-checked, but
-**Examples 1 and 2 are pending execution in a Gazebo-capable environment**. The one part that could
-be run here — the URDF-editing script in Example 2, which is plain Python and touches nothing else —
-was run, and its output is reproduced as printed. Everywhere else, described behaviour follows from
-the mechanism above, not from a transcript.
-
 ### Environment
 
 Both examples assume ROS 2 **Jazzy Jalisco** and Gazebo **Harmonic** on **Ubuntu 24.04 (Noble)**,
@@ -330,18 +330,57 @@ unchanged.
 
 ### Example 1: measuring the fall instead of watching it
 
-*Status: pending execution in a Gazebo-capable environment. Syntax-checked with `python -m
-py_compile`; uses [Chapter 1.3](../ros2/python-agents-rclpy.mdx)'s node skeleton unchanged.*
-
 "It fell over" is not a measurement, and eyes are poor at telling a robot that crumpled from one
-that toppled. This node reads the fall as numbers.
+that toppled. This node reads the fall as numbers. Before it can, the model has to say where its
+parts are in a form a ROS 2 node can act on — and Chapter 2.1's fourth exercise showed that the
+world's `/world/empty/pose/info` will not do that. Those transforms cross the bridge anonymous: the
+scene broadcaster records each pose's identity in a field the bridge's conversion never reads, so
+`frame_id` and `child_frame_id` arrive empty and the stamps arrive zero. You can count them; you
+cannot tell which link any of them belongs to.
 
-It listens to `/world/empty/pose/info`, the scene broadcaster topic from Chapter 2.1, bridged as
-`tf2_msgs/msg/TFMessage` — the pairing you worked out in that chapter's fourth exercise. One detail
-governs how to read it: the scene broadcaster publishes each entity's pose **relative to its
-parent**, so the *model* entry is in world coordinates while *link* entries are relative to the
-model. The node prints each tracked transform's parent frame on arrival so you can confirm that
-rather than take it on faith.
+So attach something that publishes poses properly. Chapter 2.1 said the Chapter 1.4 URDF carries no
+`<gazebo>` tags, which is why no Gazebo system attaches to the model; this is where that changes. A
+`<gazebo>` block is an extension the URDF specification knows nothing about, collected by
+libsdformat's URDF parser during conversion: when the block carries no `reference` attribute, its
+contents are copied into the `<model>` element of the SDF that comes out, so a `<plugin>` written
+there becomes a system attached to this model. Add this immediately before the closing `</robot>` of
+`simple_humanoid.urdf`:
+
+```xml
+  <!-- Publish the model's own pose and every link's pose on a Gazebo topic. -->
+  <gazebo>
+    <plugin filename="gz-sim-pose-publisher-system"
+            name="gz::sim::systems::PosePublisher">
+      <publish_model_pose>true</publish_model_pose>
+      <publish_link_pose>true</publish_link_pose>
+      <use_pose_vector_msg>true</use_pose_vector_msg>
+      <update_frequency>100</update_frequency>
+    </plugin>
+  </gazebo>
+```
+
+Four parameters, each earning its place. `publish_model_pose` adds the model's own pose, whose
+parent is the world — the robot's position on the ground. `publish_link_pose` adds one entry per
+link, each relative to the model. `use_pose_vector_msg` makes the plugin emit one `gz.msgs.Pose_V`
+per update instead of a stream of separate `gz.msgs.Pose` messages, which is what lets Chapter 2.1's
+`tf2_msgs/msg/TFMessage[gz.msgs.Pose_V` pairing carry it. `update_frequency` caps publication at
+100 Hz; left out, the plugin publishes on every physics step, a thousand messages a second in
+service of a report twice a second.
+
+The difference that matters is inside each message. This plugin writes a header on *every* pose,
+carrying the simulation time and two named entries — `frame_id` for the parent and `child_frame_id`
+for the entity — which are exactly the fields the bridge's conversion goes looking for. Gazebo
+scopes those names with `::` and `ros_gz` rewrites `::` as `/`, so what reaches the node is
+`simple_humanoid` with parent `empty`, and `simple_humanoid/head` with parent `simple_humanoid`:
+named, and stamped in simulated time. The node prints each tracked transform's parent frame on
+arrival so you can confirm that rather than take it on faith.
+
+Two limits worth knowing before you run it. The plugin only reads — it applies no force to anything,
+so neither of the two failures above is touched and the robot falls exactly as it did. And it
+publishes nothing while the simulation is paused, so the probe will say it is waiting until you
+press Play. The topic name is derived from the model's scoped name, world included, giving
+`/world/empty/model/simple_humanoid/pose`; confirm it with `gz topic -l | grep pose` rather than
+trusting the derivation.
 
 That gives two independent numbers, and the pair is the point. The model's **world height** says how
 far the robot dropped. The head's height **relative to the model** says whether it kept its shape:
@@ -353,11 +392,12 @@ collapsing. Save as `fall_probe.py`:
 """Measures the humanoid's fall numerically from bridged Gazebo pose data."""
 
 import rclpy
+import rclpy.clock
 from rclpy.node import Node
 
 from tf2_msgs.msg import TFMessage
 
-POSE_TOPIC = '/world/empty/pose/info'
+POSE_TOPIC = '/world/empty/model/simple_humanoid/pose'
 MODEL = 'simple_humanoid'
 HEAD = 'head'
 

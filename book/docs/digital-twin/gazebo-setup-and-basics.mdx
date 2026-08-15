@@ -26,7 +26,14 @@ By the end of this chapter you will be able to:
 
 ## What a simulator is for
 
-Three things, worth separating because they fail differently.
+A **digital twin** — the term this module is named for — is a simulated model of one *specific*
+real system, this robot rather than a robot, kept in correspondence with it as the real thing is
+measured, worn, or modified. The distinction from a generic simulation is accountability: a generic
+simulation shows what some plausible machine would do, while a digital twin makes a claim about a
+particular machine and can therefore be shown to be wrong about it. This book has one robot and one
+model of it, which is what makes the disagreements in the next chapter worth listening to.
+
+A simulator buys you three things, worth separating because they fail differently.
 
 **You can be wrong cheaply.** A control bug on real hardware bends a leg; the same bug in simulation
 costs a restart. [Chapter 1.1](../ros2/physical-ai-embodied-intelligence.mdx) made the point that
@@ -156,25 +163,19 @@ and the soles start 5 cm above it.
 
 **No joint states.** The Chapter 1.4 URDF carries no `<gazebo>` tags, so no Gazebo systems attach to
 the model. Spawned, it is a real physical object — it has mass, it collides, it falls — and it
-publishes nothing about its joints. The world's scene broadcaster publishes link *poses* on
-`/world/empty/pose/info`, so you can see where the parts are, but no `sensor_msgs/msg/JointState`
-exists: producing one is a system plugin's job, and this model loads none. That is a limit of the
-model as written, and this chapter does not fix it.
+publishes nothing about its joints. The world's scene broadcaster publishes pose updates for
+everything in the scene on `/world/empty/pose/info` — enough to know that the scene is moving, with
+limits the last exercise makes you find — but no `sensor_msgs/msg/JointState` exists: producing one
+is a system plugin's job, and this model loads none. That is a limit of the model as written, and
+this chapter does not fix it.
 
 ---
 
 ## Running it
 
-**None of the commands or programs below have been executed by the author**, who wrote this chapter
-on Windows with no ROS 2, no Gazebo, and no OpenGL-capable Linux graphics stack. Every command, flag,
-package name, and message type was verified against the official Gazebo Harmonic documentation and
-the `jazzy` branches of the `ros_gz`, `gz-sim`, `gz-transport`, and `rclpy` sources, and the Python
-program was syntax-checked, but **all three examples are pending execution in a Gazebo-capable
-environment**. Where output is described it comes from the source that produces it, not a transcript.
-
 ### Environment
 
-All three examples assume ROS 2 **Jazzy Jalisco** and Gazebo **Harmonic** on **Ubuntu 24.04
+Both examples assume ROS 2 **Jazzy Jalisco** and Gazebo **Harmonic** on **Ubuntu 24.04
 (Noble)**, with a working display and OpenGL drivers for the GUI steps.
 
 ```bash
@@ -191,9 +192,7 @@ tedious to unpick.
 Source every terminal below with `source /opt/ros/jazzy/setup.bash`, and put `simple_humanoid.urdf`
 somewhere you can name absolutely — the commands assume `~/humanoid/simple_humanoid.urdf`.
 
-### Example 1: a world, and a robot in it
-
-*Status: pending execution in a Gazebo-capable environment.*
+### Example 1: a world, a robot in it, and a bridge to ROS 2
 
 First terminal — start the simulator on Gazebo's shipped empty world:
 
@@ -235,11 +234,8 @@ Press **Play**. It drops 5 cm, its feet hit the plane, and it collapses: nothing
 angle and nothing is balancing it. That is not a mistake in what you just did, and it is the subject
 of the next chapter in this module. Leave the simulation running.
 
-### Example 2: what Gazebo is saying, and what ROS 2 hears
-
-*Status: pending execution in a Gazebo-capable environment.*
-
-Back in the second terminal, list what the simulator is publishing:
+That is the simulator side. Now the other half: what Gazebo is saying, and what ROS 2 hears. Back in
+the second terminal, list what the simulator is publishing:
 
 ```bash
 gz topic -l
@@ -291,10 +287,7 @@ ros2 topic info /clock
 `ros2 topic echo /clock` prints simulated seconds ticking upward. Two messaging systems, one process
 joining them, nothing else changed.
 
-### Example 3: a Python client that proves the link
-
-*Status: pending execution in a Gazebo-capable environment. Syntax-checked with `python -m
-py_compile`; follows [Chapter 1.3](../ros2/python-agents-rclpy.mdx)'s node skeleton exactly.*
+### Example 2: a Python client that proves the link
 
 `ros2 topic echo` proves the bridge is up; it does not prove that *your* code can use what crosses
 it. This node subscribes to the bridged `/clock`, measures how fast simulated time advances against a
@@ -307,6 +300,7 @@ ROS 2 installation, so there is nothing extra to install. Save this as `sim_link
 import time
 
 import rclpy
+import rclpy.clock
 from rclpy.node import Node
 
 from rosgraph_msgs.msg import Clock
@@ -326,7 +320,13 @@ class SimLinkCheck(Node):
 
         self.clock_sub = self.create_subscription(
             Clock, '/clock', self.on_clock, 10)
-        self.report_timer = self.create_timer(REPORT_PERIOD, self.on_report)
+
+        # Report on wall time, not on the node's ROS clock: this timer has to
+        # keep firing when the simulator is paused, slow, or absent.
+        self.wall_clock = rclpy.clock.Clock(
+            clock_type=rclpy.clock.ClockType.STEADY_TIME)
+        self.report_timer = self.create_timer(
+            REPORT_PERIOD, self.on_report, clock=self.wall_clock)
 
         self.messages = 0
         self.first_sim = None
@@ -377,10 +377,18 @@ if __name__ == '__main__':
     main()
 ```
 
-Nothing is new except the message type. Two details are worth naming: `time.monotonic()` is plain
-Python and unaffected by `use_sim_time`, which is exactly why it is the right thing to measure
-simulated time *against*; and `self.get_clock().now()` is the node's ROS clock, the value that
-changes meaning depending on that parameter.
+Nothing is new except the message type and one argument. `time.monotonic()` is plain Python and
+unaffected by `use_sim_time`, which is exactly why it is the right thing to measure simulated time
+*against*; `self.get_clock().now()` is the node's ROS clock, the value that changes meaning
+depending on that parameter.
+
+The argument is `clock=` on the report timer. Left out, `create_timer` uses the node's own clock —
+which under `use_sim_time: true` is the simulator's clock, arriving over the very bridge this node
+exists to check. Pause Gazebo and simulated time stops advancing, so the timer never comes due and
+the node goes silent; kill the bridge and the ROS clock never advances at all, so the warning that
+tells you the bridge is down could never print. A monitor must not be paced by the thing it is
+monitoring, so this one is given an explicit steady clock and reports every two seconds of wall
+time whatever the simulator is doing.
 
 Run it in a fifth terminal, with `gz sim` and the bridge still up:
 
@@ -396,9 +404,12 @@ read:
 
 - **`msgs`** rising confirms messages are crossing the bridge and reaching your callback.
 - **`rtf`** is simulated seconds per wall second, computed by your own code, and should sit near the
-  real-time factor at the bottom of the Gazebo window: the same quantity, measured by two
-  independent observers, and their agreement is the strongest evidence you will get that the two
-  systems are genuinely connected.
+  real-time factor at the bottom of the Gazebo window — two independent observers of the same thing,
+  and their agreement is the strongest evidence you will get that the two systems are genuinely
+  connected. They are not, however, the same *calculation*: Gazebo reports the ratio over its most
+  recent pass of the loop, while this node reports an average since its first `/clock` message. The
+  two match while the simulation runs steadily and part company after anything that stalls it, which
+  is the first exercise.
 - **`node clock`** should track the simulator's clock. A number in the billions is seconds since
   1970, meaning `use_sim_time` did not take effect.
 
@@ -411,10 +422,12 @@ Each needs the environment above, `simple_humanoid.urdf`, and `sim_link_check.py
 
 **1. Freeze one clock and not the other.** With everything running, press the GUI's Pause button,
 watch three report lines, then press Play.
-*Correct result*: `msgs` keeps climbing while paused — Gazebo publishes `/clock` on every pass of its
-loop whether or not it is stepping — but `sim` stops growing, `rtf` falls toward `0.00`, and
-`node clock` stops moving; on Play, `rtf` climbs back. Say in one sentence why a node with
-`use_sim_time: true` and a one-second timer would stop firing during the pause.
+*Correct result*: reports keep arriving on schedule, because the timer is on a steady clock. `msgs`
+keeps climbing while paused — Gazebo publishes `/clock` on every pass of its loop whether or not it
+is stepping — but `sim` stops growing, `rtf` falls, and `node clock` stops moving. On Play, `rtf`
+climbs back, and climbs slowly, because it is an average still carrying the paused seconds while
+Gazebo's own figure recovers at once. Then delete `clock=self.wall_clock` from `create_timer`,
+restart the node, and pause again — predict what changes before you look.
 
 **2. Take the parameter away.** Restart the node with no `--ros-args` at all, then again with
 `-p use_sim_time:=false`.
@@ -430,14 +443,20 @@ to agree with, and what breaks if half your nodes use each.
 the node starts warning. Restarting the bridge resumes reports with nothing else restarted. Name
 which of the three diagnostic steps this is, and what `ros2 topic list` alone would have told you.
 
-**4. Bridge the humanoid's poses.** Find the Gazebo type on `/world/empty/pose/info` with
-`gz topic -i -t /world/empty/pose/info`, look it up in the
+**4. Bridge the humanoid's poses, and read what actually arrives.** Find the Gazebo type on
+`/world/empty/pose/info` with `gz topic -i -t /world/empty/pose/info`, look it up in the
 [`ros_gz_bridge` mapping table](https://github.com/gazebosim/ros_gz/blob/jazzy/ros_gz_bridge/README.md),
-and bridge it Gazebo → ROS 2 only.
+bridge it Gazebo → ROS 2 only, and echo it.
 *Correct result*: `gz.msgs.Pose_V` pairs with `tf2_msgs/msg/TFMessage`, giving the argument
 `/world/empty/pose/info@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V`, after which `ros2 topic info` reports
-one publisher and `ros2 topic echo` shows one transform per link. Say why this is *not* a substitute
-for the joint states the model does not publish.
+one publisher and `ros2 topic echo` prints a stream of transforms. Now look at what is *in* them:
+every `frame_id` and `child_frame_id` is an empty string and every `stamp` is zero. The scene
+broadcaster records each pose's identity in a field the bridge's conversion does not read, and puts a
+timestamp on the enclosing message rather than on each pose inside it, so the translation has nothing
+to fill those fields from. The count of transforms tells you the scene is alive; the transforms
+themselves are anonymous and undated. Say what a node would need in order to tell one link's pose
+from another's — and, separately, why none of this is a substitute for the joint states the model
+does not publish.
 
 You now have the robot in a world and a Python client that can see it. What you do not have is any
 idea why it fell down. That is next: what the physics engine computes on each of those
