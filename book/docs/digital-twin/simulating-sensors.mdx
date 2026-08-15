@@ -1,0 +1,789 @@
+---
+sidebar_position: 4
+title: "Simulating Sensors: LiDAR, Depth Cameras, IMU"
+---
+
+# Simulating Sensors: LiDAR, Depth Cameras, IMU
+
+[Chapter 2.2](./physics-gravity-collisions.mdx) ended on a specific complaint. The humanoid has
+0.30 seconds and 4.8 degrees of margin before it tips, and nothing in the model can tell it which
+way it is leaning. It is a body with no way to find out anything.
+
+This chapter fixes the finding-out. Three sensors go on the robot — a LiDAR on the chest, a depth
+camera in the head, an IMU in the pelvis — and one Python node reads all three. That is the whole
+job, and it is smaller than it sounds: a simulated sensor is a query the simulator runs against the
+scene on a fixed schedule, and the answer is a ROS 2 message of a type you can look up.
+
+The part that is *not* small is knowing what each answer means, and where it is a lie.
+
+## Learning objectives
+
+By the end of this chapter you will be able to:
+
+- Add a LiDAR, a depth camera, and an IMU to this book's humanoid, and say which link each is
+  attached to and where on that link it sits.
+- Name the ROS 2 message type and the frame each sensor publishes in, and find both from the
+  command line when you do not know them.
+- Read all three sensors from a single Python node and extract one meaningful number from each.
+- Explain what sensor noise models and why developing against a noiseless sensor produces code that
+  fails on hardware.
+
+## Why simulate a sensor at all
+
+[Chapter 2.1](./gazebo-setup-and-basics.mdx) gave three reasons to simulate anything: mistakes are
+cheap, hardware is slow to arrive, and initial conditions repeat. All three sharpen when the subject
+is perception.
+
+**The hardware argument is strongest here.** A perception stack is the longest-lead software on a
+robot, and it is the software most tightly coupled to parts that have not been bought yet. A team
+that waits for a LiDAR before writing anything that consumes LiDAR has serialised two long jobs that
+could have run in parallel. A simulated sensor publishing the right message type on the right topic
+lets the consumer be written, tested, and largely debugged first.
+
+**The repeatability argument is the one you will use daily.** Perception bugs are usually about a
+specific input: the moment the wall left the field of view, the frame where every return was
+`inf`. On hardware, reproducing that means recreating a scene. In simulation the same scene replays
+exactly, so a fix can be *demonstrated* rather than hoped for.
+
+**The ground-truth argument is new.** Only in simulation do you know the real answer. The wall in
+this chapter's world is at *x* = 3.0 m because you put it there, so when the LiDAR says 2.90 m you
+can check that number rather than believe it. That is the single largest advantage simulated
+perception has, and it disappears the moment the robot is real.
+
+Now the other side, stated plainly, because it is where simulated perception misleads.
+
+**A simulated sensor sees the simulated world, and the simulated world is thin.** Gazebo's ground
+plane has no puddles, the wall has no glass panel, and there is no dust, rain, or direct sunlight in
+the scene. Every one of those is a first-order failure mode for a real LiDAR or depth camera.
+
+**Rendering-based sensors carry rendering's assumptions.** A depth camera in Gazebo asks the
+renderer how far away each pixel is. The renderer knows exactly; a real depth camera is
+triangulating or timing light, and is defeated by black, shiny, or transparent surfaces that the
+renderer handles without noticing.
+
+**The noise model is a caricature.** You will add Gaussian noise below, and Gaussian noise is a
+reasonable first approximation of a LiDAR's ranging error. It is not a good model of a depth
+camera's error, which grows roughly with the *square* of distance and arrives in structured patches
+rather than independently per pixel. Gazebo's depth camera does not model that at all, which makes
+it the most flattering of the three sensors in this chapter and the one most likely to embarrass
+you later.
+
+The honest summary: simulated sensors are excellent for the *shape* of your data — types, frames,
+rates, coordinate conventions, the plumbing — and unreliable for its *quality*.
+
+## What a sensor is, inside the simulator
+
+Every sensor in Gazebo Harmonic is the same three things.
+
+1. **An attachment.** The sensor belongs to a link, and inherits that link's motion. Its own `<pose>`
+   offsets it from the link's frame.
+2. **A schedule.** `<update_rate>` in hertz. The sensor is evaluated on simulation steps, so its rate
+   is in *simulated* time — a sensor at 100 Hz produces 100 readings per simulated second whether
+   that takes one wall-clock second or ten. This is the same two-clocks problem
+   [Chapter 2.1](./gazebo-setup-and-basics.mdx) described, and the reason every node here runs with
+   `use_sim_time: true`.
+3. **A query, plus noise, plus a message.** On each scheduled tick the simulator asks the scene a
+   question, corrupts the answer according to the sensor's noise model, and publishes it on a Gazebo
+   Transport topic.
+
+The queries differ, and that is the interesting part.
+
+### LiDAR: ray casting
+
+A LiDAR measures distance by sending out light and timing its return. The simulator does not
+simulate light. It **casts rays**: for each beam, it takes a start point and a direction, walks
+outward through the scene's collision geometry, and reports the distance to the first surface hit —
+or infinity if nothing is hit inside the maximum range.
+
+Three consequences follow immediately, and all three surprise people.
+
+**It sees `<visual>` geometry, not `<collision>` geometry** — and this is the exact opposite of what
+[Chapter 2.2](./physics-gravity-collisions.mdx) established about contact. The sensor type is
+`gpu_lidar` because the ray casting runs on the graphics hardware, against the scene the *renderer*
+holds, which is also why this chapter needs a machine with working OpenGL. Chapter 1.4's head makes
+the consequence concrete: physics sees a 0.12 m sphere and no visor; a LiDAR pointed at this
+humanoid sees a 0.11 m skull *and* the orange visor box. Two sensors, in the same simulator, looking
+at two different heads. Whenever a robot appears to detect something it does not collide with — or
+walks straight through something its LiDAR could see — this is why.
+
+**Cost is per ray.** A scan of 360 beams costs 360 ray casts every tick, so beams × update rate is
+the number to watch.
+
+**A beam that hits nothing returns infinity**, not zero and not the maximum range. Code that treats
+`ranges` as a list of numbers will compute a mean of `inf` on its first frame in an open field. The
+`sensor_msgs/msg/LaserScan` message carries `range_min` and `range_max` precisely so consumers can
+discard what falls outside them, and discarding is the consumer's job.
+
+### Depth cameras: per-pixel distance
+
+A depth camera produces an image whose pixel values are **distances in metres** rather than colours.
+Gazebo renders the scene from the camera's viewpoint and reads back the depth of each pixel, which
+is information a rasteriser computes anyway in order to decide which surface is in front.
+
+So a depth camera is, roughly, a very dense LiDAR confined to a rectangle. The differences that
+matter:
+
+- **Resolution and field of view are pixels and an angle**, not beams and a sweep. A 320 × 240 depth
+  image is 76,800 distances per frame.
+- **The data type is float32, one channel.** Bridged into ROS 2 it arrives as a
+  `sensor_msgs/msg/Image` with `encoding` `32FC1` — four bytes per pixel, metres. It is not an
+  8-bit picture, and viewing it as one shows you noise.
+- **Nothing beyond `<clip><far>` exists.** Pixels past the far clip plane come back non-finite, the
+  same "no return" case as the LiDAR's infinity, arriving through a different door.
+
+The sensor also publishes a point cloud (`sensor_msgs/msg/PointCloud2`) on `<topic>/points` and
+intrinsics (`sensor_msgs/msg/CameraInfo`) on `<topic>/camera_info`. Both are Module 3's business.
+The chapter's node reads the depth image.
+
+### IMU: what is actually being measured
+
+An **inertial measurement unit** is two instruments in one package: a three-axis accelerometer and a
+three-axis gyroscope. The gyroscope is straightforward — angular velocity about each body axis, in
+rad/s. The accelerometer is not, and misreading it is the most common sensor mistake in robotics.
+
+**An accelerometer does not measure acceleration. It measures *proper* acceleration** — the
+acceleration of the sensor relative to free fall. The classic demonstration is a sensor sitting
+still on a table: it is not accelerating at all, and it reads 9.8 m/s² *upward*. Drop it, and while
+it falls at 9.8 m/s² it reads **zero**.
+
+That inversion is what makes the IMU useful for the problem Chapter 2.2 left open. A stationary IMU
+reads a vector of magnitude 9.8 m/s² pointing along the sensor's local "up", so the direction of
+that vector tells you which way is down — which is a tilt measurement, from an instrument with no
+view of the outside world. It is also why an IMU alone cannot tell you where the robot *is*: getting
+position out of acceleration takes two integrations, and two integrations of a slightly biased
+signal drift away from the truth quadratically. Fixing that means combining the IMU with something
+else, which is sensor fusion, which is Module 3's job and not this chapter's.
+
+The bridged message is `sensor_msgs/msg/Imu`, carrying `linear_acceleration`, `angular_velocity`,
+and an `orientation` quaternion. Be careful with that third field: on a real IMU orientation is a
+*derived* estimate, not a measurement, and Gazebo fills it from the simulator's ground truth. Trust
+it in simulation and your code will have nothing to fall back on when the hardware arrives.
+
+## Where a sensor sits: frames
+
+Every reading is a set of numbers relative to something. That something is a **frame**, and getting
+it wrong is not a small error — it is an answer to a different question.
+
+[Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx) already gave you the machinery: every link's
+frame is defined by the joint above it, and a `fixed` joint "moves nothing but adds a frame — what a
+camera or an IMU reports its data in". The three sensors here take the shorter route and attach
+directly to existing links with a `<pose>` offset, which changes not one mass or inertia value in
+Chapter 2.2's analysis. (A real project usually does give each sensor its own link on a `fixed`
+joint. Note before you try it that libsdformat's URDF-to-SDF converter merges fixed-joint links into
+their parent by default, so the frame you carefully named may not survive the conversion.)
+
+The placements below are chosen, not arbitrary:
+
+| Sensor | Link | Why there |
+|---|---|---|
+| IMU | `base_link` (pelvis) | Near the centre of mass, so it measures the *body's* motion rather than a swinging limb's. |
+| LiDAR | `torso` | Chest height, forward-facing, above the legs. |
+| Depth camera | `head` | Behind the visor, so it looks where the head looks — and turns when `neck_joint` turns. |
+
+That last row is the whole lesson. The depth camera is on the head, so its readings are in the head's
+frame, so turning the neck changes what "2.87 metres straight ahead" means without changing a single
+number in the camera's configuration. Every reading in this chapter is a distance *from a place on a
+moving body*, and the wall at *x* = 3.0 m is 2.90 m from the chest LiDAR and 2.87 m from the head
+camera for no reason other than that the two sensors are 3 cm apart in *x*.
+
+In ROS 2 the frame travels with the data, in `header.frame_id`. The chapter's node prints that field
+the first time each sensor reports, so you read it off the wire instead of assuming it.
+
+## Noise, and the habit a clean sensor teaches
+
+Turn noise off and every example in this chapter still works. That is exactly the danger.
+
+Real sensors are wrong in characteristic ways, and the SDF noise model names three of them:
+
+- **`stddev`** — random scatter around the true value, different every reading.
+- **`bias_mean`** and **`bias_stddev`** — a constant offset drawn once when the sensor starts and
+  held for its lifetime. Averaging does not remove it. This is what makes a still IMU report a slow
+  rotation forever.
+- **`dynamic_bias_stddev`** with **`dynamic_bias_correlation_time`** — a bias that wanders slowly.
+  The reason an IMU that was accurate at the start of a run is not at the end.
+
+Now the habits a noiseless sensor teaches, all of which look like clean code at the time:
+
+**Equality and thresholds that only just work.** `if distance < 1.0` is fine when the reading is
+exactly 1.02. With 1 cm of scatter it flickers between branches ten times a second. Every real
+threshold needs hysteresis, and you will not discover that against a clean sensor.
+
+**Trusting a single reading.** One clean sample is the truth, so you write code that acts on one
+sample. One noisy sample is a vote, so you write code that filters — and the difference in structure
+is large enough that it is not a change you make later.
+
+**Never handling the missing case.** A perfect sensor in a small world always returns something. Add
+noise and an open direction, and `inf` and `NaN` become routine.
+
+The rule that follows: **develop against a noisy sensor and turn the noise off to debug**, never the
+other way round. The numbers below have `stddev` values in the range real devices report — 1 cm for
+the LiDAR, and IMU figures from the type of MEMS part a robot of this size would carry.
+
+## From a Gazebo topic to a ROS 2 topic
+
+Nothing new here, which is the point:
+[Chapter 2.1](./gazebo-setup-and-basics.mdx) established that Gazebo Transport and DDS are separate
+systems and that `ros_gz_bridge` translates named topics one at a time, in a direction you choose
+with `[`, `]`, or `@`. Sensors change none of that; they only add topics to bridge.
+
+The pairings you need, from the
+[`ros_gz_bridge` mapping table](https://github.com/gazebosim/ros_gz/blob/jazzy/ros_gz_bridge/README.md):
+
+| Sensor | SDF `type` | Gazebo message | ROS 2 message |
+|---|---|---|---|
+| LiDAR | `gpu_lidar` | `gz.msgs.LaserScan` | `sensor_msgs/msg/LaserScan` |
+| Depth camera | `depth_camera` | `gz.msgs.Image` | `sensor_msgs/msg/Image` |
+| — its point cloud | | `gz.msgs.PointCloudPacked` | `sensor_msgs/msg/PointCloud2` |
+| — its intrinsics | | `gz.msgs.CameraInfo` | `sensor_msgs/msg/CameraInfo` |
+| IMU | `imu` | `gz.msgs.IMU` | `sensor_msgs/msg/Imu` |
+
+Copy the capitalisation exactly. The IMU pairing is `gz.msgs.IMU` against `sensor_msgs/msg/Imu`, and
+a bridge argument that disagrees with the table on one letter starts cleanly and delivers nothing.
+
+One more thing is required that was not before. Sensors are produced by Gazebo *systems*, and
+Gazebo's shipped `empty.sdf` loads neither of the two that matter. Rendering-based sensors — LiDAR
+and cameras — need `gz-sim-sensors-system`, and IMUs need `gz-sim-imu-system`. A world without them
+loads your sensor definitions, reports no error, and publishes nothing, which is the most confusing
+possible failure. So this chapter uses its own world.
+
+---
+
+## Running it
+
+**None of the commands or programs below have been executed by the author**, who wrote this chapter
+on Windows with no ROS 2, no Gazebo, and no OpenGL-capable Linux graphics stack. SDF element names,
+sensor types, plugin names, and message-type pairings were checked against the Gazebo Harmonic
+documentation, the SDFormat 1.11 specification, the `gz-sensors` and `gz-sim` sources, and the
+`jazzy` branch of `ros_gz`; the URDF and world files were checked for XML well-formedness and the
+Python program was syntax-checked. **Both examples are pending execution in a Gazebo-capable
+environment.** Where output is described it follows from the mechanism above and from the source that
+produces it, not from a transcript.
+
+### Environment
+
+ROS 2 **Jazzy Jalisco** and Gazebo **Harmonic** on **Ubuntu 24.04 (Noble)**, installed exactly as in
+[Chapter 2.1](./gazebo-setup-and-basics.mdx):
+
+```bash
+sudo apt update
+sudo apt install ros-jazzy-ros-gz
+```
+
+Source every terminal with `source /opt/ros/jazzy/setup.bash`. You need `simple_humanoid.urdf` from
+[Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx) at `~/humanoid/simple_humanoid.urdf`, and the
+spawn-and-bridge sequence from Chapter 2.1, used here unchanged.
+
+**This chapter needs working GPU rendering.** `gz-sim-sensors-system` renders the depth camera and
+casts the LiDAR's rays through OGRE 2. On a machine with software rendering only, the physics and the
+IMU still work and the two rendering sensors will be slow or silent.
+
+### Example 1: mounting three sensors
+
+*Status: pending execution in a Gazebo-capable environment. Both XML files were checked for
+well-formedness with `python -m xml.etree.ElementTree`.*
+
+Copy the humanoid and edit the copy — the original stays the reference model:
+
+```bash
+cp ~/humanoid/simple_humanoid.urdf ~/humanoid/sensor_humanoid.urdf
+```
+
+Paste the block below into `sensor_humanoid.urdf` immediately before the closing `</robot>` tag.
+
+`<gazebo>` is not a URDF element. It is an extension the URDF-to-SDF converter understands: content
+inside `<gazebo reference="some_link">` is inserted into the SDF `<link>` of that name. `urdfdom` —
+and therefore `check_urdf` and `urdf_tree.py` from Chapter 1.4 — ignores it entirely, so this file is
+still a valid URDF describing the same thirteen links and 34.7 kg.
+
+```xml
+  <!-- ============ sensors ============ -->
+
+  <!-- IMU in the pelvis, at base_link's origin: near the centre of mass, so
+       it measures the body rather than a limb. Noise figures are typical of
+       a MEMS part. Note the form: <noise type="gaussian"> is an ATTRIBUTE
+       here, because the IMU reuses SDF's shared noise element. -->
+  <gazebo reference="base_link">
+    <sensor name="pelvis_imu" type="imu">
+      <pose>0 0 0 0 0 0</pose>
+      <always_on>1</always_on>
+      <update_rate>100</update_rate>
+      <topic>humanoid/imu</topic>
+      <gz_frame_id>base_link</gz_frame_id>
+      <imu>
+        <angular_velocity>
+          <x><noise type="gaussian">
+            <mean>0.0</mean><stddev>0.0002</stddev>
+            <bias_mean>0.0000075</bias_mean><bias_stddev>0.0000008</bias_stddev>
+          </noise></x>
+          <y><noise type="gaussian">
+            <mean>0.0</mean><stddev>0.0002</stddev>
+            <bias_mean>0.0000075</bias_mean><bias_stddev>0.0000008</bias_stddev>
+          </noise></y>
+          <z><noise type="gaussian">
+            <mean>0.0</mean><stddev>0.0002</stddev>
+            <bias_mean>0.0000075</bias_mean><bias_stddev>0.0000008</bias_stddev>
+          </noise></z>
+        </angular_velocity>
+        <linear_acceleration>
+          <x><noise type="gaussian">
+            <mean>0.0</mean><stddev>0.017</stddev>
+            <bias_mean>0.1</bias_mean><bias_stddev>0.001</bias_stddev>
+          </noise></x>
+          <y><noise type="gaussian">
+            <mean>0.0</mean><stddev>0.017</stddev>
+            <bias_mean>0.1</bias_mean><bias_stddev>0.001</bias_stddev>
+          </noise></y>
+          <z><noise type="gaussian">
+            <mean>0.0</mean><stddev>0.017</stddev>
+            <bias_mean>0.1</bias_mean><bias_stddev>0.001</bias_stddev>
+          </noise></z>
+        </linear_acceleration>
+      </imu>
+    </sensor>
+  </gazebo>
+
+  <!-- LiDAR on the chest. The torso frame is at the waist, so 0.32 m up is
+       chest height; 0.10 m forward clears the 0.18 m deep torso box. A flat
+       180-degree sweep of 360 beams at 10 Hz. Here <noise> takes <type> as a
+       CHILD element, because the lidar declares its own. -->
+  <gazebo reference="torso">
+    <sensor name="chest_lidar" type="gpu_lidar">
+      <pose>0.10 0 0.32 0 0 0</pose>
+      <always_on>1</always_on>
+      <update_rate>10</update_rate>
+      <visualize>true</visualize>
+      <topic>humanoid/scan</topic>
+      <gz_frame_id>torso</gz_frame_id>
+      <lidar>
+        <scan>
+          <horizontal>
+            <samples>360</samples>
+            <resolution>1</resolution>
+            <min_angle>-1.570796</min_angle>
+            <max_angle>1.570796</max_angle>
+          </horizontal>
+          <vertical>
+            <samples>1</samples>
+            <resolution>1</resolution>
+            <min_angle>0</min_angle>
+            <max_angle>0</max_angle>
+          </vertical>
+        </scan>
+        <range>
+          <min>0.20</min>
+          <max>12.0</max>
+          <resolution>0.01</resolution>
+        </range>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.01</stddev>
+        </noise>
+      </lidar>
+    </sensor>
+  </gazebo>
+
+  <!-- Depth camera in the head, just in front of the visor, whose front face
+       is at x = 0.115. A camera looks along +x of its own frame, and the
+       head's +x is forward, so no rotation is needed. Deliberately
+       noiseless: see the exercises. -->
+  <gazebo reference="head">
+    <sensor name="head_depth" type="depth_camera">
+      <pose>0.13 0 0.13 0 0 0</pose>
+      <always_on>1</always_on>
+      <update_rate>15</update_rate>
+      <topic>humanoid/depth</topic>
+      <gz_frame_id>head</gz_frame_id>
+      <camera>
+        <horizontal_fov>1.047</horizontal_fov>
+        <image>
+          <width>320</width>
+          <height>240</height>
+        </image>
+        <clip>
+          <near>0.10</near>
+          <far>10.0</far>
+        </clip>
+      </camera>
+    </sensor>
+  </gazebo>
+```
+
+Two details in there are worth stopping on, because they cost people an hour each.
+
+**The two noise forms are different.** The LiDAR writes `<noise><type>gaussian</type>...</noise>`,
+with `type` as a child element, because SDFormat's `lidar` element declares its own noise block. The
+IMU writes `<noise type="gaussian">...</noise>`, with `type` as an **attribute**, because it reuses
+SDFormat's shared `noise` element. Neither form works in the other's place. (Cameras use the LiDAR's
+form.)
+
+**`<gz_frame_id>` is a Gazebo extension, not part of the SDFormat specification.** It sets the
+`header.frame_id` of the published message, and libsdformat will warn that the element is undefined
+while Gazebo honours it anyway. It is included here because "which frame is this in?" should be
+answerable from the file rather than by experiment — but check what actually arrives, which is what
+the node in Example 2 prints.
+
+Now the world. Chapter 2.2's `physics_lab.sdf` plus the two sensor systems, plus something to
+measure: a wall whose near face is at exactly *x* = 3.0 m. Save as `sensor_world.sdf`:
+
+```xml
+<?xml version="1.0" ?>
+<sdf version="1.10">
+  <world name="sensor_lab">
+    <physics name="lab" type="dart">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system"
+            name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system"
+            name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+            name="gz::sim::systems::SceneBroadcaster"/>
+    <!-- Without these two, the sensors above load silently and publish
+         nothing. Sensors renders cameras and casts lidar rays; Imu runs
+         the accelerometer and gyroscope. -->
+    <plugin filename="gz-sim-sensors-system"
+            name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-imu-system"
+            name="gz::sim::systems::Imu"/>
+    <gravity>0 0 -9.8</gravity>
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+        </visual>
+      </link>
+    </model>
+    <!-- 0.2 m thick, centred at x = 3.1, so its near face is at x = 3.0
+         exactly. That is the number every reading below is checked against. -->
+    <model name="wall">
+      <static>true</static>
+      <pose>3.1 0 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.2 6.0 2.5</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.2 6.0 2.5</size></box>
+          </geometry>
+          <material>
+            <ambient>0.35 0.35 0.40 1</ambient>
+            <diffuse>0.60 0.60 0.65 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+  </world>
+</sdf>
+```
+
+Start it, spawn into it, and confirm the sensors exist on the Gazebo side before involving ROS 2 at
+all — that is step one of Chapter 2.1's three-step diagnosis, and doing it first saves you from
+debugging a bridge that is not the problem:
+
+```bash
+gz sim -v 4 sensor_world.sdf
+```
+
+```bash
+ros2 run ros_gz_sim create \
+  -world sensor_lab \
+  -file ~/humanoid/sensor_humanoid.urdf \
+  -name simple_humanoid \
+  -z 0.9
+```
+
+```bash
+gz topic -l | grep humanoid
+```
+
+You should see `/humanoid/imu`, `/humanoid/scan`, `/humanoid/depth`, `/humanoid/depth/points`, and
+`/humanoid/depth/camera_info` — the depth camera advertises three topics from one `<topic>` setting.
+If `grep` finds nothing, the sensors did not load: check that you edited the *copy* you spawned, and
+that the world is `sensor_world.sdf` and not `empty.sdf`.
+
+### Example 2: one node, three sensors
+
+*Status: pending execution in a Gazebo-capable environment. Syntax-checked with `python -m
+py_compile`; uses [Chapter 1.3](../ros2/python-agents-rclpy.mdx)'s node skeleton unchanged.*
+
+Three subscriptions in one node, three summary numbers, no fusion — the readings are reported side
+by side and never combined, because combining them is Module 3's subject.
+
+- **LiDAR** → the nearest valid return and its bearing. "Nearest" needs the `inf` and
+  out-of-range filtering described above, which is most of the LiDAR code.
+- **Depth camera** → the centre pixel, in metres, unpacked from the raw `32FC1` bytes with the
+  standard library's `struct`. No image library is needed to read one pixel.
+- **IMU** → the magnitude of the acceleration vector, plus the smallest and largest seen so far. The
+  running extremes matter: the most interesting values occur during a 0.1 s free fall and a
+  millisecond-scale impact, and a report every half second would miss both.
+
+Save as `sensor_probe.py`:
+
+```python
+"""Reads one summary value from each of the humanoid's three simulated sensors."""
+
+import math
+import struct
+
+import rclpy
+from rclpy.node import Node
+
+from sensor_msgs.msg import Image, Imu, LaserScan
+
+SCAN_TOPIC = '/humanoid/scan'
+DEPTH_TOPIC = '/humanoid/depth'
+IMU_TOPIC = '/humanoid/imu'
+
+REPORT_PERIOD = 0.5      # s of sim time between report lines
+DEPTH_ENCODING = '32FC1'  # 32-bit float, one channel, metres
+
+
+class SensorProbe(Node):
+
+    def __init__(self):
+        super().__init__('sensor_probe')
+
+        self.create_subscription(LaserScan, SCAN_TOPIC, self.on_scan, 10)
+        self.create_subscription(Image, DEPTH_TOPIC, self.on_depth, 10)
+        self.create_subscription(Imu, IMU_TOPIC, self.on_imu, 10)
+        self.create_timer(REPORT_PERIOD, self.on_report)
+
+        self.counts = {'scan': 0, 'depth': 0, 'imu': 0}
+        self.frames = {}
+
+        self.nearest = None        # (range m, bearing deg) or None
+        self.centre_depth = None   # m, or None for no return
+        self.accel = None          # |a| in m/s^2
+        self.accel_low = None
+        self.accel_high = None
+
+        self.get_logger().info(
+            'waiting for %s, %s and %s'
+            % (SCAN_TOPIC, DEPTH_TOPIC, IMU_TOPIC))
+
+    def note_frame(self, key, header):
+        """Report each sensor's frame_id once, read off the wire."""
+        if key not in self.frames:
+            self.frames[key] = header.frame_id
+            self.get_logger().info(
+                '%s data arrives in frame %r' % (key, header.frame_id))
+
+    def on_scan(self, msg):
+        self.counts['scan'] += 1
+        self.note_frame('scan', msg.header)
+
+        best = None
+        for index, distance in enumerate(msg.ranges):
+            # A beam that hit nothing reports inf; range_min and range_max
+            # bound what the device is willing to stand behind.
+            if not math.isfinite(distance):
+                continue
+            if distance < msg.range_min or distance > msg.range_max:
+                continue
+            if best is None or distance < best[0]:
+                best = (distance, msg.angle_min + index * msg.angle_increment)
+
+        self.nearest = None if best is None else (best[0],
+                                                  math.degrees(best[1]))
+
+    def on_depth(self, msg):
+        self.counts['depth'] += 1
+        self.note_frame('depth', msg.header)
+
+        if msg.encoding != DEPTH_ENCODING:
+            self.get_logger().warning(
+                'expected %s depth, got %r' % (DEPTH_ENCODING, msg.encoding))
+            return
+
+        row = msg.height // 2
+        column = msg.width // 2
+        offset = row * msg.step + column * 4
+        layout = '>f' if msg.is_bigendian else '<f'
+        value, = struct.unpack_from(layout, msg.data, offset)
+        self.centre_depth = value if math.isfinite(value) else None
+
+    def on_imu(self, msg):
+        self.counts['imu'] += 1
+        self.note_frame('imu', msg.header)
+
+        a = msg.linear_acceleration
+        magnitude = math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z)
+        self.accel = magnitude
+        if self.accel_low is None or magnitude < self.accel_low:
+            self.accel_low = magnitude
+        if self.accel_high is None or magnitude > self.accel_high:
+            self.accel_high = magnitude
+
+    def on_report(self):
+        if not any(self.counts.values()):
+            self.get_logger().warning(
+                'no sensor messages yet -- is the world running, and is the '
+                'bridge started?')
+            return
+
+        if self.nearest is None:
+            scan_text = 'lidar nothing in range'
+        else:
+            scan_text = 'lidar %.3f m at %+.1f deg' % self.nearest
+
+        if self.centre_depth is None:
+            depth_text = 'depth centre no return'
+        else:
+            depth_text = 'depth centre %.3f m' % self.centre_depth
+
+        if self.accel is None:
+            imu_text = 'imu no data'
+        else:
+            imu_text = ('imu |a| %5.2f (seen %.2f..%.2f) m/s2'
+                        % (self.accel, self.accel_low, self.accel_high))
+
+        self.get_logger().info(
+            '%s | %s | %s | msgs %d/%d/%d'
+            % (scan_text, depth_text, imu_text,
+               self.counts['scan'], self.counts['depth'],
+               self.counts['imu']))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SensorProbe()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+With `gz sim` and the spawned robot still up, start the bridge — four topics now, all one-way from
+Gazebo:
+
+```bash
+ros2 run ros_gz_bridge parameter_bridge \
+  /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock \
+  /humanoid/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan \
+  /humanoid/depth@sensor_msgs/msg/Image[gz.msgs.Image \
+  /humanoid/imu@sensor_msgs/msg/Imu[gz.msgs.IMU
+```
+
+```bash
+python3 sensor_probe.py --ros-args -p use_sim_time:=true
+```
+
+Nothing arrives yet: the world is paused, no steps are being taken, and a sensor with no steps has
+nothing to sample. Press **Play** and read the sequence.
+
+**The first report, while the robot is still upright.** This is the one to check against the world
+file, and it is the whole reason a wall was put at a known distance:
+
+- The LiDAR sits at *x* ≈ 0.10 m and the wall's face at *x* = 3.0 m, so the nearest return should be
+  about **2.90 m at about 0 degrees** — jittering by a centimetre or so, because you gave it 1 cm of
+  Gaussian noise.
+- The depth camera sits 3 cm further forward, so its centre pixel should read about **2.87 m**, and
+  should not jitter at all, because you gave it no noise.
+- `|a|` should be near **9.8** — the robot standing still, its accelerometer reading gravity upward.
+
+If the two distances differ by much more than the 3 cm their `<pose>` values predict, something is
+wrong with a `<pose>`, not with the sensors.
+
+**Then the fall from Chapter 2.2, in three signals.** The robot was spawned 5 cm above the ground:
+
+- During the drop, `|a|` goes to nearly **zero**. This is the free-fall result from earlier in the
+  chapter, and it is the single most useful thing this example shows you: an accelerometer in free
+  fall reads nothing. The `seen` low-water mark captures it even if no report line lands inside the
+  0.1 s window.
+- At impact `|a|` spikes far above 9.8 — the ground stopping 34.7 kg in a few milliseconds. The
+  `seen` high-water mark captures that too.
+- As the humanoid collapses, the chest LiDAR and head camera pitch toward the floor. The nearest
+  return collapses from 2.90 m to something short, and the depth centre pixel follows or drops to
+  *no return* as the camera ends up looking at the sky.
+
+Once it has settled, `|a|` returns to about 9.8 — the robot is at rest again — but the *direction*
+of that vector has changed, which is exactly the tilt signal Chapter 2.2 said a balance controller
+would need and did not have. This chapter does not build that controller. It has given it something
+to read.
+
+If a report line shows `msgs 0/0/N` or similar, one bridge argument is wrong while the others are
+fine: check that pairing against the table above, letter by letter, before checking anything else.
+
+## Exercises
+
+Each needs the environment above, `sensor_humanoid.urdf`, `sensor_world.sdf`, and `sensor_probe.py`.
+
+**1. Find the frames without being told.** Before reading `sensor_probe.py`'s frame lines, predict
+what `header.frame_id` each sensor will carry. Then run it, and also check `ros2 topic echo
+/humanoid/imu --field header.frame_id` and `ros2 topic info /humanoid/scan`.
+*Correct result*: the three `<gz_frame_id>` values you wrote — `base_link`, `torso`, `head` — and
+`ros2 topic info` reporting type `sensor_msgs/msg/LaserScan` with one publisher, the bridge. Then
+delete the `<gz_frame_id>` line from one sensor, respawn, and record what arrives instead. Say why
+publishing readings with a wrong `frame_id` is worse than publishing none.
+
+**2. Make the noise visible, then take it away.** Watch four or five report lines with the robot
+upright and write down the spread in the LiDAR's nearest range. Then set the LiDAR's `<stddev>` to
+`0.0`, respawn, and compare. Then set it to `0.10` and compare again.
+*Correct result*: roughly ±1–3 cm of scatter at `0.01`, a value that stops moving at `0.0`, and
+scatter of order ±10–30 cm at `0.10`, at which point the nearest return may occasionally be a beam
+whose noise happened to be large and negative rather than the beam actually pointing at the wall.
+Say what that last effect does to code that steers away from `nearest`, and what you would add to
+`on_scan` to defend against it.
+
+**3. Move the camera and predict the number.** The depth camera is at `0.13 0 0.13` in the head
+frame. Change its `<pose>` to `0.13 0 0.13 0 0.35 0` — pitched down by 0.35 rad — respawn, and
+predict the centre-pixel reading before you look. You will need the camera's height above the
+ground, which you can add up from Chapter 1.4's joint origins.
+*Correct result*: standing, `base_link` is 0.85 m up, the torso frame 0.07 m above that, the head
+frame 0.42 m above that, and the camera 0.13 m above that — **1.47 m**. The wall face is 2.87 m
+ahead, and a downward pitch of 0.35 rad would meet the floor only at 1.47 / tan(0.35) ≈ 4.0 m of
+horizontal distance, so the centre ray still lands on the wall, at about 2.87 / cos(0.35) ≈
+**3.06 m**. Check the sign of your rotation: if the reading gets *shorter* rather than longer, you
+pitched the camera up. Say why the LiDAR's reading is unaffected by this edit.
+
+**4. Watch the sensor rates disagree with the clock.** Let the simulation run for a known stretch of
+simulated time and compare each sensor's message count against its `<update_rate>`. Then set the
+world's `max_step_size` to `0.0001` and repeat.
+*Correct result*: counts in the ratio 100 : 15 : 10 for IMU : depth : LiDAR, matching the update
+rates, and after the change the same counts per *simulated* second while the real-time factor falls
+by roughly ten — Chapter 2.2's step-size trade-off, now visible in sensor data. Say what this means
+for a perception node that assumes a fixed wall-clock interval between frames, and which of the two
+clocks such a node should be reading.
+
+---
+
+The humanoid now produces data of the same shape a real robot's would: distances in a frame, a depth
+image in metres, and a gravity vector that says which way is down. Three separate answers to three
+separate questions, none of which agrees with the others about anything yet — the LiDAR has no
+opinion about tilt, and the IMU has never heard of the wall.
+
+Turning three partial views into one estimate of where the robot is and what is around it is sensor
+fusion, and it is where Module 3 begins. Before that, one more chapter in this module: a second
+renderer, for the times when the audience for the simulation is a human rather than a physics
+engine.
