@@ -1,0 +1,439 @@
+---
+sidebar_position: 3
+title: "Isaac ROS & Visual SLAM"
+---
+
+# Isaac ROS & Visual SLAM
+
+[Chapter 3.1](./isaac-sim-synthetic-data.mdx) closed with a dataset that has exact labels and no
+idea where the robot is right now. That is not a gap in that chapter's scope — it is the boundary
+between two different problems. This chapter is the first one in the book whose subject is a
+robot answering, for itself, from a camera stream, the question every other capability depends
+on: **where am I?**
+
+**This chapter needs an NVIDIA RTX-class GPU**, as [Module 3's landing page](./index.mdx) and
+[Chapter 3.1](./isaac-sim-synthetic-data.mdx) both already said. Isaac ROS's perception packages
+are built on CUDA; there is no CPU fallback. As with that chapter, the theory below stands
+entirely on its own — you can read every idea here, and reason correctly about a real pose
+stream, without running anything. The code that talks to a live GPU is marked exactly where it
+appears, and a second, GPU-free example lets you exercise the reasoning this chapter teaches
+against a recorded pose stream instead.
+
+## Learning objectives
+
+By the end of this chapter you will be able to:
+
+- Explain why "where am I" is the problem a robot must solve before any other capability is
+  useful, and why mapping and localizing turn out to be the same problem.
+- Explain what visual SLAM consumes as input and produces as output.
+- Explain what Isaac ROS is, and why GPU acceleration matters specifically for per-frame visual
+  tracking.
+- Subscribe to a pose estimate from a Python node — with the required hardware — and read it from
+  a recorded pose stream without it.
+- Name at least two conditions under which visual SLAM will fail, and recognise the symptom each
+  one leaves in a pose stream.
+
+## The problem: a robot that cannot answer "where am I"
+
+[Chapter 1.1](../ros2/physical-ai-embodied-intelligence.mdx) laid out the sense-think-act loop and
+named, in its capability table, that turning raw sensor data into "where am I" is this module's
+job. Nothing built so far in this book has done that. [Module 2](../digital-twin/index.mdx) gave
+the humanoid a chest LiDAR, a head depth camera, and a pelvis IMU, and each of those sensors
+answers a narrow, local question — how far away is the nearest obstacle, how far away is the
+thing this pixel points at, which way is down. None of them answers "where, in the room, is the
+robot standing, and which way is it facing." A LiDAR return of 2.9 m is meaningless without
+knowing where the sensor that produced it was standing when it fired. Every capability this book
+still owes the humanoid — planning a path to a goal, following a spoken instruction to "go to the
+kitchen" — needs a position to reason from. Without one, a
+plan is a description of *how to move*, not *where to move to*, and an instruction naming a place
+cannot be turned into motion at all.
+
+**SLAM** — simultaneous localization and mapping — is the standard answer to this, and the name
+states its central, genuinely surprising claim: localizing and mapping are not two problems to
+solve in either order, but one problem, because each depends on the other's answer. To know
+*where* you are, you need a map to locate yourself against. To build a map, you need to know
+where you were standing when you recorded each piece of it. A robot dropped into an unknown space
+has neither to start with, so it must build both at once, using each new observation to refine
+both its estimate of the map and its estimate of its own position within it. This is why SLAM is
+usually presented as one algorithm rather than "mapping" followed by "localizing" — the two
+estimates are computed together because each one constrains the other on every single update.
+
+**Visual SLAM** is SLAM where the sensor is a camera. It takes a stream of images — [Chapter
+2.3](../digital-twin/simulating-sensors.mdx)'s depth camera on the humanoid's head is exactly this
+kind of sensor, now feeding a different consumer — and, frame by frame, does two things at once:
+it estimates how the camera has moved since the last frame (**odometry**), and it maintains a
+growing map of distinctive visual features it has seen (**landmarks**), so that if the camera
+later returns somewhere it has been before, it can recognise the place and correct any error that
+built up in the meantime. What goes in is a camera stream. What comes out is a **pose estimate** —
+the camera's position and orientation, updated every frame — and a **map**, the accumulated graph
+of landmarks the pipeline uses to keep that pose estimate honest over time. Nothing about visual
+SLAM tells the robot what a landmark *is* in human terms — no labels, no object classes, just
+pixels that are distinctive and trackable enough to relocate later. That is a different problem,
+closer to what [Chapter 3.1](./isaac-sim-synthetic-data.mdx)'s synthetic dataset trains a model
+to solve, and visual SLAM does not need it solved first.
+
+## What Isaac ROS is
+
+**Isaac ROS is a set of GPU-accelerated ROS 2 packages, not a separate framework you learn instead
+of ROS 2.** This distinction matters because Isaac Sim, the subject of the last chapter, really is
+a separate piece of software with its own scene format and its own Python interpreter. Isaac ROS
+is the opposite kind of thing: it is ordinary ROS 2 — the same `rclpy`, the same topics and
+messages, the same `ros2 launch` you have already used throughout Modules 1 and 2 — with certain
+perception-heavy nodes reimplemented to run their core computation on the GPU instead of the CPU,
+using NVIDIA's NITROS transport to move image data between GPU-accelerated nodes without copying
+it back to host memory on every hop. A node built with Isaac ROS subscribes to and publishes
+ordinary ROS 2 topics with ordinary message types, and a plain `rclpy` node — including every
+example this book has written so far — can talk to it without knowing or caring that CUDA is
+involved on the other end. The package this chapter uses, **`isaac_ros_visual_slam`**, is Isaac
+ROS's GPU-accelerated visual SLAM implementation, built on NVIDIA's `cuVSLAM` library, and it
+publishes exactly the kind of pose estimate the theory above described.
+
+## Why GPU acceleration matters here specifically
+
+Not every ROS 2 node needs a GPU, and this book has not needed one before this module. Visual SLAM
+is a genuinely different kind of workload from a `LaserScan` subscriber or a joint-state
+publisher, and the reason is the *rate* at which it must repeat expensive work. Every single frame
+a camera produces — for a camera running at 30 or 60 frames per second, that is thirty or sixty
+times a second — the pipeline must find distinctive features across the whole image, match them
+against features from the previous frame and against the accumulated landmark map, and solve for
+the camera's motion that best explains how those matched points moved. That is a large amount of
+per-pixel, per-frame numerical work, and it has a hard deadline: if the pipeline cannot finish one
+frame's worth of feature extraction and matching before the next frame arrives, it falls behind,
+and a pose estimate that arrives late is a pose estimate for where the robot *was*, not where it
+is. A CPU can do this work; it typically cannot do it fast enough to keep up with a live camera
+feed while leaving CPU headroom for everything else a robot's stack has to run at the same time.
+A GPU's architecture — thousands of small cores built for exactly this kind of massively parallel,
+identical operation repeated across every pixel — is a much closer match to what per-frame feature
+extraction actually is, which is why Isaac ROS's visual SLAM implementation exists as a
+GPU-accelerated package rather than a CPU one with a GPU option.
+
+## The pipeline, end to end
+
+Concretely, for this book's humanoid: [Chapter 2.3](../digital-twin/simulating-sensors.mdx) put a
+depth camera in the head, on the `head` link, and [Chapter 3.1](./isaac-sim-synthetic-data.mdx)
+described the step, once, that carries the same URDF into Isaac Sim as a USD scene. Point that
+camera's image and depth streams at `isaac_ros_visual_slam`, and the pipeline that comes back out
+is: camera images in, at whatever rate the camera renders them → per-frame feature extraction and
+matching on the GPU → a pose estimate and a growing landmark map out, published as ordinary ROS 2
+topics any subscriber can read. This is the piece [Chapter 1.1](../ros2/physical-ai-embodied-intelligence.mdx)'s
+capability table named as this module's job and left unbuilt: the humanoid ends Module 2 able to
+report a LiDAR return and a depth pixel, and ends this chapter able to report where it is standing
+while it does it.
+
+Two ROS 2 message types carry that answer, and this chapter verified both against
+`isaac_ros_visual_slam`'s own source. On `visual_slam/tracking/odometry`, the node publishes a
+`nav_msgs/msg/Odometry` — a `pose.pose.position` and `pose.pose.orientation` giving the current
+estimate relative to a fixed `odom` frame, and a `twist.twist` giving the current estimated
+velocity in the robot's own frame. On `visual_slam/tracking/vo_pose`, the same estimate is
+published again as a plain `geometry_msgs/msg/PoseStamped`, for a subscriber that only wants the
+pose and does not want to reach through `Odometry`'s nested `pose.pose` to get it. Either topic
+answers "where am I" for a Python node; the code example below reads the first one, because a
+robot deciding what to do next usually wants the velocity too.
+
+## Failure modes: how visual SLAM breaks, and what that looks like
+
+A visual SLAM pose estimate is a *best-effort estimate built from evidence*, not ground truth, and
+it is only as good as the visual evidence the camera hands it. Knowing the four ways it commonly
+fails is not optional background — it is the difference between a reader who can tell "the pose
+estimate is wrong" from "the humanoid actually fell over," and one who cannot.
+
+**Featureless walls.** Feature extraction needs something in the image to extract — corners,
+edges, texture, anything a matcher can reliably re-detect a frame later. A camera pointed at a
+blank, evenly lit wall, a plain ceiling, or a stretch of uniform floor gives the pipeline nothing
+distinctive to track: every patch of pixels looks like every other patch, so a match found this
+frame is no more likely to be correct than a match found in the wrong place entirely. The symptom
+is a pose estimate that drifts wildly, freezes, or jumps unpredictably for exactly as long as the
+camera has nothing but that blank surface in view, and recovers once texture returns to the frame.
+
+**Motion blur.** Feature matching assumes a feature looks roughly the same from one frame to the
+next. Fast rotation or fast translation — a head turning quickly, a humanoid's torso pitching
+sharply during a stumble — smears the image over the exposure time of a single frame, and a
+smeared corner is not the same pattern of pixels a matcher extracted a moment ago. The symptom is
+the pipeline losing track abruptly during the fast motion and either failing to produce a pose
+update at all for that stretch, or producing one with visibly higher uncertainty, even though
+nothing about the environment itself has changed.
+
+**Drift.** Every single frame's pose estimate carries a small amount of error, because feature
+matching and motion estimation are approximate, not exact. Left uncorrected, that per-frame error
+accumulates — this is the literal meaning of drift, and it is the argument for accumulating a map
+of landmarks at all rather than only ever estimating motion relative to the previous frame. A pose
+estimate that has drifted is not obviously wrong from any single frame; it only becomes visible
+over time, as the reported position walks steadily away from the truth even on a robot standing
+still, or fails to return to zero after walking a loop back to its starting point.
+
+**Loop closure**, and its failure. When the camera returns to a place it has mapped before, the
+pipeline can recognise the previously seen landmarks and use that recognition to correct
+whatever drift accumulated on the way — this is what makes visual SLAM meaningfully better than
+plain visual odometry, which only ever estimates frame-to-frame motion and has no way to correct
+itself this way. A correction like this looks, in the pose stream, like a real but sudden jump —
+not a teleport, but the estimate snapping toward a value the pipeline now trusts more. The failure
+case is the same event *not* happening: if the environment does not offer a recognisable enough
+match — the lighting changed too much, the camera approached the same place from a very different
+angle, or the place was one of the featureless stretches above — no correction fires, and whatever
+drift had accumulated stays in the estimate permanently.
+
+All four of these are, from the pipeline's point of view, the same underlying failure: not enough
+reliable visual evidence to trust. A reader who has internalised that will diagnose a wild pose
+jump correctly as "the camera was probably looking at a blank wall a moment ago" rather than "the
+humanoid teleported," and will know to check the camera's view, not the robot's legs, first.
+
+## Running it
+
+### Environment
+
+**Isaac ROS `release-4.5`**, on **ROS 2 Jazzy Jalisco** / **Ubuntu 24.04 (Noble)**, paired with
+**Isaac Sim** for the simulated camera stream, and an **NVIDIA GPU of the Ampere architecture or
+newer** with **8 GB or more of VRAM**, **CUDA 13.0 or newer**, and **driver 580 or newer** — the
+same requirements [Module 3's landing page](./index.mdx) lists. The package this chapter targets
+is **`isaac_ros_visual_slam`**, verified against its own source on the `release-4.5` branch and
+against [`nvidia-isaac-ros.github.io`](https://nvidia-isaac-ros.github.io/); its node is launched,
+not run standalone, with `ros2 launch isaac_ros_visual_slam
+isaac_ros_visual_slam_isaac_sim.launch.py` against a running Isaac Sim scene — the exact camera
+topic remappings that launch file expects are Isaac Sim scene configuration this chapter does not
+walk through, in the same spirit [Chapter 3.1](./isaac-sim-synthetic-data.mdx) did not walk
+through the USD importer's menus.
+
+**Neither example below has been run against real hardware.** The development environment used to
+write this book is Windows with no NVIDIA GPU, so nothing that talks to `isaac_ros_visual_slam`
+over a live topic could be executed here. Example 1 is checked for Python syntax only
+(`python -m py_compile`) and is marked `blocked`, environment required: `nvidia-rtx-gpu`. Example 2
+needs no such hardware — it is plain Python against a JSON Lines file — and *was* executed, against
+a small hand-built pose stream shaped like a robot walking a loop, exactly so its reasoning could
+be checked before this chapter shipped it.
+
+### Example 1: subscribing to the pose estimate
+
+This node subscribes to `visual_slam/tracking/odometry` — a `nav_msgs/msg/Odometry` — and appends
+one JSON line per message to `pose_log.jsonl`, in a schema Example 2 reads back. It assumes
+`isaac_ros_visual_slam` is already running in another terminal, tracking the humanoid's head depth
+camera stream from a live Isaac Sim scene.
+
+**Status: `blocked`. Environment required: `nvidia-rtx-gpu` running Isaac Sim + Isaac ROS
+`release-4.5`. Checked for Python syntax only (`python -m py_compile`); not executed.**
+
+```python
+"""Subscribe to the pose estimate Isaac ROS Visual SLAM publishes while it
+tracks the humanoid's head depth camera stream inside Isaac Sim, and log
+each estimate as one JSON line for offline inspection.
+
+Run isaac_ros_visual_slam first, in its own terminal, against the
+humanoid's simulated RGB-D stream (see "Running it" above):
+
+    ros2 launch isaac_ros_visual_slam isaac_ros_visual_slam_isaac_sim.launch.py
+
+Then run this node in a second terminal:
+
+    python3 subscribe_pose.py
+
+Environment: Isaac ROS release-4.5, ROS 2 Jazzy Jalisco, Ubuntu 24.04,
+an NVIDIA RTX-class GPU (Ampere or newer, CUDA 13.0+, driver 580+).
+"""
+
+import json
+import os
+
+import rclpy
+from rclpy.node import Node
+from nav_msgs.msg import Odometry
+
+POSE_TOPIC = 'visual_slam/tracking/odometry'
+LOG_PATH = os.path.join(os.path.dirname(__file__), 'pose_log.jsonl')
+
+
+class PoseLogger(Node):
+
+    def __init__(self):
+        super().__init__('pose_logger')
+        self._log = open(LOG_PATH, 'a')
+        self.create_subscription(Odometry, POSE_TOPIC, self.on_odometry, 10)
+        self.get_logger().info('logging %s to %s' % (POSE_TOPIC, LOG_PATH))
+
+    def on_odometry(self, msg):
+        position = msg.pose.pose.position
+        orientation = msg.pose.pose.orientation
+        record = {
+            'stamp': msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+            'frame_id': msg.header.frame_id,
+            'child_frame_id': msg.child_frame_id,
+            'position': {'x': position.x, 'y': position.y, 'z': position.z},
+            'orientation': {
+                'x': orientation.x, 'y': orientation.y,
+                'z': orientation.z, 'w': orientation.w,
+            },
+        }
+        self._log.write(json.dumps(record) + '\n')
+        self._log.flush()
+
+    def destroy_node(self):
+        self._log.close()
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PoseLogger()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+Run to completion against a live scene, this would leave `pose_log.jsonl` growing by one line per
+odometry message — at the camera's frame rate — each line a snapshot of where `isaac_ros_visual_slam`
+currently believes the head camera is, in the `odom` frame, with the humanoid's own motion
+reflected in how that position changes from line to line.
+
+### Example 2: reading drift and loop closure from a pose stream
+
+The catalog's code example asks for a Python node reading the pose estimate; this second example
+is the GPU-free companion this chapter promised, reading a pose stream that is already on disk
+instead of subscribing to a live one, in exactly the schema Example 1 writes. It reports the total
+distance walked, how far the final estimate landed from the first, and flags any single-step jump
+large enough to be a loop closure correction rather than ordinary motion — the on-paper version of
+the diagnosis the failure-modes section above described.
+
+**Status: executed and passing.** Run against a hand-built `pose_log.jsonl` — 80 records of a
+robot walking a 4 m square loop, with a small drift vector added to every reported position and a
+single correction, partway through the final leg, that removes it — exactly the kind of
+correction a real loop closure produces. This checks the script's reasoning; it is not a real
+Isaac ROS run, since none was available to produce one.
+
+```python
+"""Inspect a JSONL pose log in the schema subscribe_pose.py writes -- no
+GPU or ROS 2 install required, standard library only.
+
+Usage: python inspect_pose_log.py [path-to-pose_log.jsonl]
+"""
+
+import json
+import math
+import sys
+
+JUMP_THRESHOLD_M = 0.5  # a per-step jump larger than this, at this log's
+                         # ~0.2 m/frame walking pace, is far more consistent
+                         # with a loop-closure correction snapping the pose
+                         # graph than with the frame's own motion.
+
+
+def distance(a, b):
+    return math.sqrt(
+        (a['x'] - b['x']) ** 2 + (a['y'] - b['y']) ** 2 + (a['z'] - b['z']) ** 2
+    )
+
+
+def main():
+    log_path = sys.argv[1] if len(sys.argv) > 1 else 'pose_log.jsonl'
+
+    with open(log_path) as handle:
+        records = [json.loads(line) for line in handle if line.strip()]
+
+    if len(records) < 2:
+        print('need at least two pose records to say anything about drift')
+        return 1
+
+    path_length = 0.0
+    jumps = []
+    for previous, current in zip(records, records[1:]):
+        step = distance(previous['position'], current['position'])
+        path_length += step
+        if step > JUMP_THRESHOLD_M:
+            jumps.append((current['stamp'], step))
+
+    start = records[0]['position']
+    end = records[-1]['position']
+    net_gap = distance(start, end)
+
+    print('frames:                   %d' % len(records))
+    print('path length walked:       %.2f m' % path_length)
+    print('net start-to-end gap:     %.2f m' % net_gap)
+    print('loop-closure-sized jumps: %d' % len(jumps))
+    for stamp, step in jumps:
+        print('  at t=%.1fs: %.2f m jump' % (stamp, step))
+
+    print()
+    if jumps:
+        print('a jump this size is not the robot teleporting -- it is the pose')
+        print('graph correcting itself once cuVSLAM recognised a previously')
+        print('seen landmark and closed the loop.')
+    elif net_gap > 0.3:
+        print('no loop closure fired and the estimate has not returned to its')
+        print('start -- this is what unmitigated drift looks like on paper.')
+    else:
+        print('estimate returned close to its start with no single large jump.')
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
+```
+
+Against the hand-built log described above, this prints:
+
+```text
+frames:                   80
+path length walked:       16.24 m
+net start-to-end gap:     0.16 m
+loop-closure-sized jumps: 1
+  at t=7.1s: 0.64 m jump
+
+a jump this size is not the robot teleporting -- it is the pose
+graph correcting itself once cuVSLAM recognised a previously
+seen landmark and closed the loop.
+```
+
+Sixteen metres walked over a four-metre-per-side square loop, one correction partway through the
+last leg, and a final position sixteen centimetres from where the walk began — small residual
+error is normal even after a successful loop closure; a pose stream with no jump at all and a
+large `net start-to-end gap` would be the drift-with-no-correction case the script's other branch
+names, and the one to suspect first if this ran against a real log that never revisited familiar
+ground.
+
+## Exercises
+
+**1. Read a live pose without a GPU — reason about the schema instead.** Without running Example 1,
+answer from its code alone: which field of the `nav_msgs/msg/Odometry` message holds the estimated
+*orientation*, and which holds the estimated *linear velocity*? Which ROS 2 frame is the position
+reported relative to by default?
+*Correct result*: `msg.pose.pose.orientation` (a quaternion, `x`/`y`/`z`/`w`); `msg.twist.twist.linear`
+for velocity; position is relative to the `odom` frame. If you answered `msg.pose.orientation`
+without the second `.pose`, re-read `nav_msgs/msg/Odometry`'s structure — `pose` and `twist` are
+each a *With Covariance* wrapper one level deeper than the plain field looks.
+
+**2. Build a featureless-wall log and detect it — no GPU required.** Using Example 2's JSON schema,
+hand-write a short `pose_log.jsonl` of ten records where the reported position stays frozen at
+exactly the same `x`/`y`/`z` for five consecutive frames in the middle of an otherwise steadily
+moving sequence — Example 2 does not check for this directly, so first decide what field(s) of its
+output would look different for a frozen stretch versus normal motion, then run it and confirm.
+*Correct result*: `path length walked` is shorter than it would be if those five frames had kept
+moving at the surrounding rate — a frozen stretch removes distance from the total without producing
+a jump, which is a different signature from both ordinary motion and a loop closure. Say, in one
+sentence, which of this chapter's four failure modes a stretch like this is most consistent with.
+
+**3. Name two failure modes from a symptom, not a definition.** A pose stream shows the estimate
+jump unpredictably back and forth for two seconds while the humanoid's head was turning quickly to
+track something, then settle down and track normally again once the head stopped turning.
+*Correct result*: motion blur is the primary cause named in this chapter matching that symptom —
+fast rotation smearing the frames the pipeline needed to match. A reasonable second guess is a
+featureless surface briefly filling the frame during the turn, which is why this chapter said the
+right first check is what the camera was actually looking at, not just how fast it was moving.
+
+**4. Loop closure or drift — decide from `net start-to-end gap` alone.** Suppose Example 2 reported
+`loop-closure-sized jumps: 0` and `net start-to-end gap: 2.10 m` against a log recorded from a robot
+that walked a loop back to within a few centimetres of its starting point.
+*Correct result*: this is unmitigated drift with no correction — the pipeline never recognised the
+starting corner as a place it had already seen, so nothing fired to remove the roughly two metres
+of accumulated error. Say one plausible reason recognition might have failed, drawing on this
+chapter's failure modes (for example: the robot approached the corner from a very different angle,
+or lighting had changed enough that the same corner no longer produced matching features).
+
+---
+
+The humanoid can now answer "where am I" from a camera stream — a pose estimate on
+`visual_slam/tracking/odometry`, and a growing map of landmarks behind it, with named symptoms for
+when that answer should not be trusted. What it still cannot do is turn that answer, plus a goal,
+into a path across a room it has not already memorised. That is Nav2's job, and this module's next
+chapter.
