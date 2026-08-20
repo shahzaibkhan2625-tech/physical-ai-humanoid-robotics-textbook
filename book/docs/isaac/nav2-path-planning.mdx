@@ -1,0 +1,631 @@
+---
+sidebar_position: 4
+title: "Nav2: Path Planning for Bipeds"
+---
+
+# Nav2: Path Planning for Bipeds
+
+[Chapter 3.2](./isaac-ros-visual-slam.mdx) ended with the humanoid able to answer "where am I" —
+a pose estimate on `visual_slam/tracking/odometry`, updated every frame, honest about when to be
+distrusted. A pose answers one question, and a robot standing still needs more than that. Give it
+a destination — "the far corner of the room" — and a pose alone does not get it there. Something
+still has to turn "here" and "there" into a sequence of motions that does not walk the robot
+through a wall on the way. That something is **Nav2**, ROS 2's navigation stack, and this chapter
+is about what it needs before it can do that job, and what changes when the thing walking on the
+plan it produces has two feet instead of wheels.
+
+**This chapter needs no NVIDIA GPU on its own** — Nav2 is ordinary ROS 2, CPU-bound like the
+nodes in [Module 1](../ros2/index.mdx). What it does need is a running Nav2 stack fed by a map and
+a live pose, which is more moving infrastructure than this book has stood up in one place before.
+As with every chapter in this module, the theory below stands on its own, and the code that talks
+to a live stack is marked exactly where it appears.
+
+## Learning objectives
+
+By the end of this chapter you will be able to:
+
+- Describe what Nav2 needs before it can plan a path: a map, a pose, and a goal.
+- Explain the split between global planning and local control, and what a costmap is and where its
+  data comes from.
+- Explain ROS 2 actions — the third communication primitive, after topics and services — and why a
+  long-running, cancellable, feedback-producing goal needs one.
+- Send a navigation goal from Python, read its feedback as it streams in, and cancel it before it
+  completes.
+- Explain at least one reason a wheeled-robot navigation stack is not enough for a humanoid.
+
+## The problem: a pose and a goal are not yet a path
+
+[Chapter 1.1](../ros2/physical-ai-embodied-intelligence.mdx)'s sense–think–act loop named
+"decide where to go" as a thinking step, and up to this chapter this book has never actually built
+it. A pose says where the robot is right now. A goal says where it should end up. Neither says how
+to get from one to the other without colliding with anything in between, and "anything in between"
+is exactly what the robot cannot fully know in advance: a map built earlier may be stale, and the
+route the map suggests may have a box in it today that was not there when the map was made.
+
+Splitting the job into two problems, run by two different pieces of software at two different
+rates, is Nav2's answer, and each half exists because the other cannot do its job.
+
+**Global planning** answers "what is a good route across the whole map, ignoring for a moment
+exactly how the robot's body moves." It runs against the full map, infrequently — once per goal, and
+again only if something forces a replan — and produces a path: a sequence of waypoints from here to
+the goal. It does not need to run fast, because the map barely changes between one planning call and
+the next, but it also cannot be trusted moment to moment, because the map is not the room.
+
+**Local control** answers "given the plan and what the robot can see right now, what velocity command
+do I send this instant." It runs fast — tens of times a second — using only a *local*, fresh window of
+sensor data, and its job is to track the global plan while swerving around whatever the global
+planner did not and could not know about: a person who just walked into frame, a chair that has moved.
+A local controller with no global plan would wander with no destination; a global plan with no local
+controller would walk the robot straight into the first thing the map got wrong.
+
+Neither half is optional, and neither can substitute for the other. That is the actual argument for
+the split, not just an implementation detail: global planning is a *map* problem, solved slowly and
+rarely; local control is a *now* problem, solved fast and constantly, and conflating them means either
+a planner recomputing the whole route thirty times a second for no reason, or a robot with no way to
+react to anything the map did not already know about.
+
+## Costmaps: what turns sensor data into a planning surface
+
+Both halves of Nav2 plan against the same kind of data structure: a **costmap**, a 2D grid laid over
+the map where every cell holds a cost — how expensive, or how forbidden, it is to put the robot there.
+A planner does not reason about a LiDAR return or a depth pixel directly; it reasons about a grid of
+numbers, and the costmap is what turns the first thing into the second.
+
+A costmap is built in layers, each contributing its own opinion about the same grid, and Nav2
+combines them:
+
+- A **static layer**, from the map itself — walls and permanent obstacles are high cost or lethal
+  before a single sensor reading arrives.
+- An **obstacle layer**, from live sensor data — [Chapter 2.3](../digital-twin/simulating-sensors.mdx)'s
+  chest LiDAR and head depth camera are exactly the kind of sensor this layer consumes, marking cells
+  where something is detected right now that the static map does not know about. Where that layer's
+  input is not a raw range reading but the output of a learned detector, the training data behind it
+  is the subject of [Chapter 3.1](./isaac-sim-synthetic-data.mdx) — this chapter takes the detections
+  as given and is concerned only with what the grid does with them.
+- An **inflation layer**, which spreads cost outward from every obstacle by roughly the robot's own
+  radius, so the planner treats the space right next to a wall as expensive rather than planning a
+  path that grazes it and trusting the controller to thread the needle exactly.
+
+Two costmaps exist for the two halves above: a **global costmap**, covering the whole map, mostly
+built from the static layer and updated slowly; and a **local costmap**, a small window centred on the
+robot, rebuilt continuously from live sensor data, and used by the controller for the reactive part of
+its job. The split in data structures mirrors the split in responsibilities exactly.
+
+## What Nav2 needs before it can plan anything
+
+Given the split above, Nav2's inputs are not mysterious — they are exactly what global planning and
+local control each need to do their half of the job:
+
+1. **A map.** Global planning needs the static layer to plan against. [Chapter 3.2](./isaac-ros-visual-slam.mdx)'s
+   visual SLAM pipeline is one way to build one — its landmark map, converted to the kind of 2D
+   occupancy grid Nav2 consumes, though that conversion is its own piece of tooling this chapter does
+   not walk through.
+2. **A pose.** Both halves need to know where the robot is *in that map's frame*, continuously —
+   without it, a "goal" is a location relative to nothing. This is the pose estimate
+   [Chapter 3.2](./isaac-ros-visual-slam.mdx) produced, and the dependency is exact: Nav2 does not
+   localize a robot itself, and cannot plan a single step without something upstream of it doing so.
+3. **A goal.** A target pose — position and orientation — in the map frame, provided once per
+   navigation task, either by a person or by whatever higher-level decision-making sits above Nav2.
+
+Structurally, Nav2 is a set of ordinary ROS 2 nodes launched together — a planner server, a controller
+server, the costmap nodes feeding both, and a **behavior-tree navigator** that sequences the whole
+thing: send the current pose and goal to the planner, hand the resulting path to the controller, watch
+for failure and trigger a recovery (back up, clear the costmap, retry) if the controller reports one.
+`nav2_bringup`'s `navigation_launch.py` brings up that set of servers against a map and pose that are
+already available; `bringup_launch.py` adds localization on top. What decision logic lives inside that
+behavior tree, and how to author or reconfigure one, is a real subject — and out of scope here, the
+same way this chapter does not walk through tuning any of the many parameters each server exposes.
+What matters for this chapter is narrower and load-bearing: the behavior tree is what turns "here is a
+pose and a goal" into "call the planner, then the controller, then handle failure," and the thing you
+hand it that pose and goal *through* is the subject of the rest of this chapter.
+
+## The third ROS 2 primitive: actions
+
+[Chapter 1.2](../ros2/ros2-architecture.mdx) built the decision rule for topics versus services and
+then named a case neither one fits: work that takes real time, where the caller wants to know it is
+progressing and wants the option to change its mind. "Walk to the far corner of the room" is exactly
+that case, restated concretely. A topic cannot carry it — there is no result to report, and no way for
+the robot to say "goal accepted" or "goal failed." A service technically could send the goal and
+block until the walk finishes, but that leaves the caller frozen for as long as the walk takes, with
+no visibility into progress and no way to call it off if the room changes underneath it.
+
+An **action** is ROS 2's answer, and it is built from three parts instead of one: a **goal**, sent
+once by the client; a stream of **feedback**, published by the server while the goal runs; and a
+**result**, returned once, when the goal finishes, is rejected, or is cancelled. Under the hood an
+action is topics and services working together — the client library manages all of that — but the
+part worth keeping is the shape: unlike a service, the client is never blocked waiting, because
+accepting the goal and finishing the goal are two separate, asynchronous events, and unlike a topic,
+there is a definite result at the end that the client can wait for if it wants to.
+
+Nav2's `bt_navigator` node offers exactly this pattern under the action name `navigate_to_pose`, of
+type `nav2_msgs/action/NavigateToPose`. Verified against the `navigation2` repository's `jazzy`
+branch, its three parts are:
+
+```text
+# goal
+geometry_msgs/PoseStamped pose
+string behavior_tree      # empty string: use bt_navigator's default configured tree
+
+# result
+uint16 error_code         # NONE = 0
+string error_msg
+
+# feedback
+geometry_msgs/PoseStamped current_pose
+builtin_interfaces/Duration navigation_time
+builtin_interfaces/Duration estimated_time_remaining
+int16 number_of_recoveries
+float32 distance_remaining
+```
+
+That `behavior_tree` field is worth calling out on its own: it lets a goal request a specific
+behavior tree file by name, but an empty string — what every example below sends — falls back to
+whichever tree `bt_navigator` was configured with by default, confirmed against that same node's
+source. You never have to touch behavior-tree authoring to send a goal; you only have to touch it if
+you want to override the default sequencing, which this chapter's scope does not ask you to do.
+
+You can inspect any action from the command line the same way [Chapter 1.2](../ros2/ros2-architecture.mdx)
+inspected topics and services, verified against the `ros2cli` tutorial in `ros2_documentation`'s
+`jazzy` branch: `ros2 action list` names every action currently advertised, `ros2 action list -t` adds
+its type, `ros2 action info /navigate_to_pose` reports how many clients and servers are attached, and
+`ros2 interface show nav2_msgs/action/NavigateToPose` prints the three-part structure above straight
+from the installed interface package.
+
+## Sending, watching, and cancelling a goal from Python
+
+`rclpy.action.ActionClient` is the client-side object, and the shape it asks for is the same shape
+the action itself has, one method per part:
+
+- Construct it once with the node, the action type, and the action's name:
+  `ActionClient(self, NavigateToPose, 'navigate_to_pose')`.
+- `wait_for_server()` blocks until a server under that name exists — the action equivalent of a
+  service client's `wait_for_service`.
+- `send_goal_async(goal_msg, feedback_callback=...)` sends the goal and returns immediately with a
+  future for whether the goal was *accepted*; the callback you pass fires once per feedback message
+  while the goal runs.
+- The accepted future resolves to a **goal handle** — not the result itself, but an object with
+  `.accepted`, and two more methods on it: `get_result_async()`, which returns a second future for
+  the eventual result, and `cancel_goal_async()`, which requests cancellation and returns a future
+  for whether the server accepted the cancellation.
+
+Three separate futures, three separate callbacks, and none of them block the node's single thread —
+[Chapter 1.3](../ros2/python-agents-rclpy.mdx)'s rule that a callback must return quickly is exactly
+why this is built as callbacks and futures rather than a `send_goal()` that simply returns when the
+robot arrives. A node sending a multi-minute navigation goal cannot spend those minutes inside one
+callback; `rclpy` needs the thread back to keep processing feedback, timers, and everything else the
+node does.
+
+Cancellation follows the same shape: hold on to the goal handle from the acceptance callback, and
+call `.cancel_goal_async()` on it whenever you decide to — from a timer, from a new higher-priority
+goal arriving, from an operator's interrupt. The result future still fires afterward, now reporting
+`STATUS_CANCELED` from `action_msgs/msg/GoalStatus` instead of `STATUS_SUCCEEDED`, so the same result
+callback that handles a normal finish handles a cancelled one too.
+
+## What changes for a biped
+
+Everything above — costmaps, global and local planning, the `navigate_to_pose` action — was
+developed for, and is described in Nav2's own documentation in terms of, a wheeled robot, and three
+of the assumptions baked into that description do not survive contact with two legs.
+
+**The footprint moves.** A costmap's inflation layer, mentioned above, spreads cost outward from
+obstacles by "roughly the robot's own radius" — a single, fixed footprint the planner keeps clear of
+lethal cost everywhere along the path. A wheeled base's footprint is that shape, constantly, whether
+it is moving or standing still. A biped's is not: [Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx)'s
+humanoid supports itself on two feet roughly 0.18 m apart when standing, and on one foot — half that
+contact area, and not centred under the robot at all — for a fraction of every stride. A planner using
+one fixed footprint the whole time is either too conservative during double support, where the true
+footprint is smaller than the fixed one it assumed, or unsafe during single support, where the true
+footprint is smaller still and off to one side.
+
+**Footholds are discrete, not continuous.** A wheeled robot can, in principle, occupy any point the
+costmap says is free — a path is a curve, and the base can follow it continuously. A biped cannot put
+a foot down "roughly here"; it commits to one of a finite number of concrete foot placements, each of
+which must itself be flat, clear, and load-bearing, and it cannot revise a foothold once weight is
+on it the way a wheeled base can nudge its trajectory mid-motion. A global plan that only ever
+describes a 2D route the robot's centre should follow says nothing about where, exactly, forty
+individual footsteps along that route should land.
+
+**Balance is a constraint the plan does not know about.** A wheeled base does not fall over for
+lacking a plan — worst case, it stops. A biped can. Staying upright requires keeping the robot's
+centre of mass within the support polygon of whatever foot or feet are currently planted, every
+instant, independent of whether the path itself is a good one. Nav2's planner and controller have no
+model of this at all; they were built for a robot whose stability does not depend on its footprint's
+sequence in time.
+
+None of this means Nav2 is the wrong tool for a humanoid — it is still exactly the right layer for
+"what is a good route across the room," the global-planning half of the split this chapter opened
+with. What it means is that Nav2's 2D path is an *input* to a lower layer this book has not built:
+one that turns that path into a concrete sequence of footholds and a controller that keeps the robot
+balanced while stepping to each one in turn. That layer is a **footstep planner**, and naming it as
+the gap is this chapter's job, not closing it — building one is a substantially larger undertaking
+than fits here, and doing it justice is out of this chapter's scope.
+
+## Running it
+
+### Environment
+
+**ROS 2 Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**, with **Nav2** — the `navigation2` release line
+paired with Jazzy — already running: a map loaded, a localization source publishing the robot's pose
+in the `map` frame (Chapter 3.2's `isaac_ros_visual_slam`, or any other localization source Nav2
+accepts), and the planner, controller, and behavior-tree servers brought up together, typically with
+`ros2 launch nav2_bringup navigation_launch.py`. Package: `nav2_msgs`, for the `NavigateToPose` action
+type, and `geometry_msgs` and `action_msgs` for the message types the action is built from — all three
+ship with any ROS 2 Jazzy install that includes Nav2. Verified against the `navigation2` repository's
+`jazzy` branch (`nav2_msgs/action/NavigateToPose.action`, `nav2_bt_navigator`'s source for the
+`navigate_to_pose` action name and the empty-`behavior_tree` fallback) and against `ros2/examples`'
+`jazzy` branch for the `rclpy.action.ActionClient` pattern itself.
+
+**Neither example below has been run against a live Nav2 stack.** The development environment used
+to write this book is Windows with no ROS 2 install, so nothing that talks to `navigate_to_pose` over
+a live action server could be executed here. Example 1 is checked for Python syntax only
+(`python -m py_compile`) and is marked `blocked`, environment required: a running ROS 2 Jazzy + Nav2
+stack with a map and localization active — deliberately not a GPU requirement, since the action
+client itself is plain `rclpy` and `nav2_msgs`. Example 2 needs neither ROS 2 nor Nav2 — it is plain
+Python, standard library only — and *was* executed, exactly so its reasoning about balance could be
+checked before this chapter shipped it.
+
+### Example 1: sending, watching, and cancelling a navigation goal
+
+This node builds a `PoseStamped` goal in the `map` frame, sends it as a `NavigateToPose` action goal,
+logs every feedback message as it arrives, and — if a timeout is given on the command line — cancels
+the goal partway through and reports whether the cancellation was accepted.
+
+**Status: `blocked`. Environment required: a running ROS 2 Jazzy + Nav2 stack with a map and
+localization active. Checked for Python syntax only (`python -m py_compile`); not executed.**
+
+```python
+"""Send a NavigateToPose goal to Nav2, log feedback as it streams in,
+report the result, and cancel the goal early if a timeout is given.
+
+Assumes a Nav2 stack is already running against the humanoid -- a map
+loaded, a localization source publishing the robot's pose in the map
+frame (Chapter 3.2's isaac_ros_visual_slam pose estimate, or any other
+localization source Nav2 accepts), and the planner, controller, and
+behavior-tree servers all up under a lifecycle manager -- and sends one
+goal to the navigate_to_pose action bt_navigator advertises by default.
+
+Usage:
+    python3 send_nav_goal.py X Y YAW_RAD [CANCEL_AFTER_SECONDS]
+
+Environment: ROS 2 Jazzy Jalisco, Ubuntu 24.04, a running Nav2 stack
+(the navigation2 release paired with Jazzy) with a map and localization
+already active.
+"""
+
+import math
+import sys
+
+from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import PoseStamped
+from nav2_msgs.action import NavigateToPose
+
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.node import Node
+
+
+def yaw_to_quaternion(yaw):
+    """A 2D heading in radians, as the z/w quaternion PoseStamped expects."""
+    return {'z': math.sin(yaw / 2.0), 'w': math.cos(yaw / 2.0)}
+
+
+class NavGoalClient(Node):
+
+    def __init__(self, x, y, yaw, cancel_after=None):
+        super().__init__('nav_goal_client')
+        self._client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self._goal_handle = None
+        self._cancel_after = cancel_after
+        self._cancel_timer = None
+        self._goal_pose = self._build_goal_pose(x, y, yaw)
+
+    def _build_goal_pose(self, x, y, yaw):
+        pose = PoseStamped()
+        pose.header.frame_id = 'map'
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = x
+        pose.pose.position.y = y
+        quaternion = yaw_to_quaternion(yaw)
+        pose.pose.orientation.z = quaternion['z']
+        pose.pose.orientation.w = quaternion['w']
+        return pose
+
+    def send_goal(self):
+        self.get_logger().info('waiting for the navigate_to_pose action server...')
+        self._client.wait_for_server()
+
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose = self._goal_pose
+        goal_msg.behavior_tree = ''  # empty: bt_navigator falls back to its default tree
+
+        self.get_logger().info(
+            'sending goal: x=%.2f y=%.2f'
+            % (self._goal_pose.pose.position.x, self._goal_pose.pose.position.y))
+
+        send_goal_future = self._client.send_goal_async(
+            goal_msg, feedback_callback=self.on_feedback)
+        send_goal_future.add_done_callback(self.on_goal_response)
+
+    def on_feedback(self, feedback_msg):
+        feedback = feedback_msg.feedback
+        self.get_logger().info(
+            'feedback: %.2f m remaining, %d recoveries so far'
+            % (feedback.distance_remaining, feedback.number_of_recoveries))
+
+    def on_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().info('goal rejected by the behavior tree navigator')
+            rclpy.shutdown()
+            return
+
+        self.get_logger().info('goal accepted')
+        self._goal_handle = goal_handle
+
+        if self._cancel_after is not None:
+            self._cancel_timer = self.create_timer(self._cancel_after, self.on_cancel_timeout)
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.on_result)
+
+    def on_cancel_timeout(self):
+        self._cancel_timer.cancel()
+        self.get_logger().info(
+            'cancel_after=%.1fs elapsed, cancelling the goal' % self._cancel_after)
+        cancel_future = self._goal_handle.cancel_goal_async()
+        cancel_future.add_done_callback(self.on_cancel_response)
+
+    def on_cancel_response(self, future):
+        cancel_response = future.result()
+        if len(cancel_response.goals_canceling) > 0:
+            self.get_logger().info('cancellation accepted by the action server')
+        else:
+            self.get_logger().info('goal had already finished; nothing to cancel')
+
+    def on_result(self, future):
+        result = future.result().result
+        status = future.result().status
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info('navigation succeeded')
+        elif status == GoalStatus.STATUS_CANCELED:
+            self.get_logger().info('navigation was cancelled')
+        else:
+            self.get_logger().info(
+                'navigation ended with status %d: %s' % (status, result.error_msg))
+        # The node does not know in advance when the goal will finish, so
+        # shutdown happens here, from inside the callback that finds out,
+        # rather than after a fixed rclpy.spin() call in main() -- the same
+        # pattern ros2/examples' minimal_action_client uses.
+        rclpy.shutdown()
+
+
+def main(args=None):
+    if len(sys.argv) < 4:
+        print('usage: send_nav_goal.py X Y YAW_RAD [CANCEL_AFTER_SECONDS]')
+        raise SystemExit(1)
+
+    x, y, yaw = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
+    cancel_after = float(sys.argv[4]) if len(sys.argv) > 4 else None
+
+    rclpy.init(args=args)
+    node = NavGoalClient(x, y, yaw, cancel_after)
+    node.send_goal()
+    rclpy.spin(node)
+
+
+if __name__ == '__main__':
+    main()
+```
+
+Run against a live stack with no fourth argument, `python3 send_nav_goal.py 2.0 1.0 0.0` would log
+`goal accepted`, a `feedback:` line roughly every planner tick with `distance_remaining` counting down,
+and finally `navigation succeeded` once the humanoid's pose estimate reaches the goal. Run with a
+fourth argument — `python3 send_nav_goal.py 2.0 1.0 0.0 3.0` — the same goal would be sent, a handful
+of feedback lines would arrive, and three seconds after acceptance the node would log
+`cancelling the goal`, `cancellation accepted by the action server`, and finally
+`navigation was cancelled` from the same result callback that reports success on the uninterrupted
+run — exactly the property that makes actions the right primitive here: the caller can change its
+mind mid-goal, and the server tells it what happened.
+
+### Example 2: checking balance a Nav2 path never has to
+
+Nav2's planner reasons about one fixed footprint and never asks whether the robot is about to fall
+over — the theory above named this as one concrete reason a wheeled-robot navigation stack is not
+enough for a biped. This script makes that reason checkable: given which foot (or feet) is currently
+on the ground and where the robot's centre of mass is, it answers the question Nav2 never asks,
+using the actual foot dimensions and hip spacing from [Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx)'s
+`simple_humanoid.urdf`. It is not a footstep planner — it takes foot placements as given rather than
+choosing them — which is exactly the boundary this chapter draws around that larger, out-of-scope
+problem.
+
+**Status: executed and passing.** Run against four hand-picked scenarios covering standing still,
+starting a step before and after shifting weight, and a mid-stride lean. This checks the script's
+geometry; it is not a real Nav2 or bipedal-controller run, since neither was available to produce one.
+
+```python
+"""Check whether the humanoid's centre of mass projects inside the support
+polygon of whatever foot (or feet) is currently planted -- no ROS 2, no
+Nav2, and no GPU required, standard library only.
+
+This is not a footstep planner: it takes foot placements and a support
+phase as given and only answers "is the robot balanced right now" -- the
+question a wheeled base never has to ask, because its footprint never
+lifts off the ground.
+
+Usage: python check_support_polygon.py
+"""
+
+# Half the l_foot / r_foot box from Chapter 1.4's simple_humanoid.urdf
+# (0.22 x 0.10 x 0.06 m), and the hip lateral offset (+/-0.09 m) that sets
+# where the two feet sit when the robot stands square.
+FOOT_HALF_LENGTH = 0.11
+FOOT_HALF_WIDTH = 0.05
+LEFT_FOOT_DEFAULT = (0.0, 0.09)
+RIGHT_FOOT_DEFAULT = (0.0, -0.09)
+
+
+def foot_rectangle(center):
+    """The four ground-contact corners of one foot, centred on `center`."""
+    cx, cy = center
+    return [
+        (cx - FOOT_HALF_LENGTH, cy - FOOT_HALF_WIDTH),
+        (cx - FOOT_HALF_LENGTH, cy + FOOT_HALF_WIDTH),
+        (cx + FOOT_HALF_LENGTH, cy + FOOT_HALF_WIDTH),
+        (cx + FOOT_HALF_LENGTH, cy - FOOT_HALF_WIDTH),
+    ]
+
+
+def convex_hull(points):
+    """Andrew's monotone chain, returned counter-clockwise."""
+    points = sorted(set(points))
+    if len(points) <= 2:
+        return points
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in points:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+
+    upper = []
+    for p in reversed(points):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+
+    return lower[:-1] + upper[:-1]
+
+
+def point_in_convex_polygon(point, hull):
+    if len(hull) < 3:
+        return False
+    sign = None
+    for i in range(len(hull)):
+        a, b = hull[i], hull[(i + 1) % len(hull)]
+        cross = (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])
+        if cross == 0:
+            continue
+        positive = cross > 0
+        if sign is None:
+            sign = positive
+        elif positive != sign:
+            return False
+    return True
+
+
+def support_polygon(support_phase, left_foot=LEFT_FOOT_DEFAULT, right_foot=RIGHT_FOOT_DEFAULT):
+    """The convex hull of whatever foot/feet are on the ground right now."""
+    if support_phase == 'double':
+        corners = foot_rectangle(left_foot) + foot_rectangle(right_foot)
+    elif support_phase == 'left':
+        corners = foot_rectangle(left_foot)
+    elif support_phase == 'right':
+        corners = foot_rectangle(right_foot)
+    else:
+        raise ValueError("support_phase must be 'double', 'left', or 'right'")
+    return convex_hull(corners)
+
+
+def is_balanced(com_xy, support_phase, left_foot=LEFT_FOOT_DEFAULT, right_foot=RIGHT_FOOT_DEFAULT):
+    hull = support_polygon(support_phase, left_foot, right_foot)
+    return point_in_convex_polygon(com_xy, hull)
+
+
+SCENARIOS = [
+    (
+        'standing still, both feet planted, COM centred between them',
+        (0.0, 0.0), 'double',
+    ),
+    (
+        'starting a right step, weight not yet shifted (COM still centred)',
+        (0.0, 0.0), 'left',
+    ),
+    (
+        'starting a right step, weight properly shifted onto the left foot',
+        (0.0, 0.09), 'left',
+    ),
+    (
+        'mid-stride lean, COM drifted forward and outward past the toe',
+        (0.14, 0.09), 'left',
+    ),
+]
+
+
+def main():
+    for description, com_xy, phase in SCENARIOS:
+        balanced = is_balanced(com_xy, phase)
+        verdict = 'BALANCED' if balanced else 'FALLING'
+        print('%-58s -> %s' % (description, verdict))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+```
+
+Against the four scenarios above, this prints:
+
+```text
+standing still, both feet planted, COM centred between them -> BALANCED
+starting a right step, weight not yet shifted (COM still centred) -> FALLING
+starting a right step, weight properly shifted onto the left foot -> BALANCED
+mid-stride lean, COM drifted forward and outward past the toe -> FALLING
+```
+
+The second and third lines are the same moment in a stride — the instant the right foot leaves the
+ground — with one difference: whether the robot shifted its weight onto the left foot *first*. A
+wheeled base never has to sequence anything like that; it can start moving in a new direction the
+instant a path says to. A biped that lifts a foot before shifting its centre of mass over the foot
+staying down simply falls, regardless of how good the 2D path underneath it is — precisely the
+constraint Nav2's planner has no model of, made concrete instead of asserted.
+
+## Exercises
+
+**1. Read the action's three parts, not just its name.** Without running Example 1, answer from the
+`NavigateToPose` structure printed in "The third ROS 2 primitive" above: which field would you check
+to report *how much farther* the robot has to go, and which one would tell you *how many times* Nav2
+already tried a recovery behaviour on this goal?
+*Correct result*: `feedback.distance_remaining` for the first, `feedback.number_of_recoveries` for
+the second — both arrive on every feedback message, not just at the end.
+
+**2. Trace a cancellation without a live Nav2 stack.** Read `on_cancel_timeout`, `on_cancel_response`,
+and `on_result` in Example 1 and write out, in order, every log line the node would print for a run
+with `cancel_after=3.0` where the goal takes eight seconds to reach on an uninterrupted run.
+*Correct result*: `waiting for the navigate_to_pose action server...`, `sending goal: ...`,
+`goal accepted`, one or more `feedback: ...` lines, then at t=3s `cancel_after=3.0s elapsed,
+cancelling the goal`, `cancellation accepted by the action server`, and finally
+`navigation was cancelled` — never `navigation succeeded`, because the cancellation reaches the
+server before the eight-second goal would have finished on its own.
+
+**3. Extend the balance check — no ROS 2 or Nav2 required.** Using Example 2's functions, write three
+more scenarios: (a) `'right'` support with the centre of mass still over the left foot's old position,
+(b) `'double'` support with the centre of mass shifted 0.20 m sideways, well outside both feet, and
+(c) a foothold you choose yourself, passed as a custom `left_foot` or `right_foot` argument, that
+turns an otherwise `FALLING` case into `BALANCED`.
+*Correct result*: (a) and (b) both report `FALLING` — say, for each, which of this chapter's three
+biped-specific concerns (moving footprint, discrete footholds, balance constraint) the scenario
+demonstrates. For (c), the printed verdict must flip from `FALLING` to `BALANCED` when you rerun it
+with your chosen foot position; if it does not, the centre of mass you picked is still outside the
+hull your foot placement produces.
+
+**4. Wheeled or biped — decide, in writing, for two Nav2 questions.** (a) "Is there a clear path from
+here to the goal, given the map and the current obstacle layer?" (b) "Given that path, is the robot
+about to fall over during the next step?"
+*Correct result*: (a) is squarely Nav2's job — global planning against a costmap, unaffected by how
+many legs the robot has. (b) is not something Nav2 answers for any robot; for a wheeled base the
+question barely applies, and for a biped it is the footstep-planning and balance-control gap this
+chapter named but did not close. If you answered "Nav2" for (b), reread "What changes for a biped."
+
+---
+
+The humanoid can now turn a pose and a goal into a 2D path it walks toward, watch that walk progress
+through feedback, and call it off if it changes its mind — the third ROS 2 communication primitive,
+put to the use this book has been deferring since [Chapter 1.2](../ros2/ros2-architecture.mdx) named
+it. It is also now precise about where that capability stops: Nav2 says where to go, not where each
+foot lands or how to stay upright between one foothold and the next. That is a real, still-open
+problem — footstep planning and balance control — and naming it honestly, rather than quietly
+assuming a wheeled robot's assumptions still hold, is this chapter's actual contribution to the
+humanoid's stack.
