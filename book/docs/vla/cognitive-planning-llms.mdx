@@ -1,0 +1,701 @@
+---
+sidebar_position: 3
+title: "Cognitive Planning with LLMs"
+---
+
+# Cognitive Planning with LLMs
+
+[Chapter 4.1](./voice-to-action-whisper.mdx) ended with an honest limit on what it built. Its
+five-command table can turn "stop" or "turn left" into an action, and it refuses everything else on
+purpose — but "everything else" includes ordinary requests like "tidy the table" or "bring me the
+red cup." Neither of those is a mis-transcription or an edge case; they are exactly the kind of thing
+a person asks for, and neither names one of the robot's known commands at all. They name a *goal*,
+and reaching it takes several of the robot's actions in some order the speaker never spelled out.
+
+This chapter is about the piece that sits between a goal like that and the bounded, known actions a
+robot can actually take: a **planner**, built from a large language model, that turns an instruction
+into a sequence of steps drawn from a fixed vocabulary — and, just as importantly, a **validator**
+that checks every step of that sequence before any of it is allowed to move the robot. The chapter's
+whole argument can be stated in one sentence up front: an LLM is a fallible component, so it is never
+the LLM's output that is trusted — it is the validator that stands between that output and the
+robot's actuators, and that boundary is what this chapter builds.
+
+**This chapter needs no GPU and no simulator running.** It needs a way to call a language model —
+this book uses Claude, through Anthropic's API — and, same as every chapter in this module, a reader
+without an API key can still read every idea here and study the validator's real, executed output.
+Everything targets **ROS 2 Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**, **Python 3.12**, and the
+`anthropic` Python SDK.
+
+## Learning objectives
+
+By the end of this chapter you will be able to:
+
+- Explain the gap between an instruction like "tidy the table" and the primitives a robot actually
+  has, and why that gap is a planning problem rather than a bigger command table.
+- Explain how an LLM acts as a planner that decomposes a goal into a sequence of skills the robot
+  already has, and how that differs from the flat, one-phrase-one-command mapping Chapter 4.1 built.
+- Explain grounding: why a plan may only name skills the robot actually has, and why an ungrounded
+  plan is meaningless rather than merely incorrect.
+- Explain why structured output, not free prose, is the contract between a planning model and a
+  robot, and what a JSON plan schema buys that a paragraph of instructions does not.
+- Validate an LLM-produced plan against a skill registry before dispatch, and name the checks a
+  validator must perform at minimum.
+- Describe what happens when a step fails or a plan is rejected, and how bounded replanning fits
+  into that.
+- Explain, briefly, where Vision-Language-Action models fit relative to this LLM-as-planner approach.
+
+## From an instruction to a goal nothing here can name directly
+
+Every command Chapter 4.1 handled was one atomic thing: `STOP`, `TURN_LEFT`, `WALK_FORWARD`. Its
+bounded table works precisely because each phrase maps to exactly one action the robot is ready to
+execute immediately, with no intermediate reasoning required. "Tidy the table" breaks that
+assumption at the first step. It is not a mis-transcription of a known command, and it is not close
+to one — extending the bounded table with a `TIDY_TABLE` entry would not work, because "tidy" is not
+one motion the robot's body can perform. It is a description of an end state — the table has fewer
+things on it than it started with — reached by some sequence of the robot's *actual* primitives:
+walk somewhere, pick something up, walk somewhere else, put it down, possibly repeated.
+
+That sequence is not fixed in advance the way a command table is. "Tidy the table" said nothing
+about which object to move first, where it should end up, or how many objects are on the table at
+all — a person asking for it assumes whoever hears it will work that out. Producing that sequence
+from an underspecified goal is a genuinely different job from matching a phrase to a label, and it is
+the job this chapter gives to a language model.
+
+## The LLM as a planner, not an executor
+
+Feed a large language model the instruction and a description of what the robot can do, and ask it
+to return an ordered sequence of those actions with concrete arguments — "walk to `(1.0, 2.0)`, pick
+up `red_cup`, walk to `(-1.0, 0.0)`, place `red_cup` on `counter`" — and you have a **plan**: a
+composition of known primitives that, if the plan is right and every step succeeds, reaches the
+requested goal. The model never touches the robot. It does not decide *how* a step happens — turning
+`walk_to(1.0, 2.0)` into leg motion is Nav2's job, from [Chapter 3.3](../isaac/nav2-path-planning.mdx),
+and every other primitive here would have its own downstream executor the same way. The model's job
+starts and ends at composing which known steps, in which order, with which arguments.
+
+This is the real contrast with Chapter 4.1's table, and it is worth being precise about it: 4.1's
+table is a **lookup** — one phrase in, one command out, no reasoning involved, which is exactly why
+it could be trusted with nothing more than string comparison. A planner is not a lookup. It has to
+decide how many steps a goal needs, in what order, and with what arguments, none of which was spelled
+out in the instruction — genuine composition, not matching. That is a strictly harder job, which is
+exactly why it needs a strictly stronger safety net than exact-string matching gives Chapter 4.1's
+table. The rest of this chapter is that net.
+
+## Grounding: a plan may only use verbs the robot has
+
+A plan step is **grounded** if it names a skill the robot's dispatcher actually implements, with
+arguments in a form that skill accepts. `walk_to(x=1.0, y=2.0)` is grounded if `walk_to` exists and
+takes an `(x, y)` pair; a step like `tidy_table()` or `find_nearest_clean_surface()` is not, no
+matter how sensible it sounds as English, because nothing downstream knows what to do with it.
+
+This is a different failure from a *wrong* grounded step. `walk_to(x=1.0, y=2.0)` when the robot
+should have gone to `(2.0, 1.0)` is wrong — it names a real skill, with an argument in the right
+shape, that just sends the robot to the wrong place. That failure is at least legible: the dispatcher
+can execute it, something observable happens, and a person watching can tell the plan was mistaken.
+An ungrounded step has no such foothold. There is no partial credit, no "close enough" execution, no
+way to run `tidy_table()` even badly — it is not a bad instruction, it is not an instruction to this
+robot at all, and pretending otherwise is exactly the nearest-match reasoning
+[Chapter 4.1](./voice-to-action-whisper.mdx) rejected for a mis-transcribed word, now applied to a
+mis-imagined skill. That is why grounding is checked before anything about whether a plan looks
+sensible: a plan that isn't grounded doesn't get to the point of being right or wrong, because there
+is nothing for the dispatcher to try in the first place.
+
+The stakes are the same ones [Chapter 4.1](./voice-to-action-whisper.mdx) named for a single
+misheard word: a plan reaching an actuator eventually reaches
+[Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx)'s twelve revolute joints. A five-command table
+kept that boundary simple — one exact match or nothing. A planner made of several steps, each with
+its own arguments, needs the same boundary held just as strictly, over a much larger space of things
+that could go wrong.
+
+## Structured output as the contract between model and robot
+
+A language model's native output is prose. Prose is not an interface a dispatcher can safely consume:
+extracting "the plan" from a paragraph means parsing free text with regular expressions or another
+model call, both of which introduce exactly the kind of ambiguity Chapter 4.1 spent a whole section
+arguing a voice interface cannot afford — a parser guessing at what a sentence meant is the same
+problem as a nearest-match transcript, one layer further down the pipeline.
+
+The fix is to never let the model answer in prose at all. Anthropic's Claude models support **tool
+use**: you describe a function-shaped "tool" with a JSON Schema for its arguments, and the model
+returns a structured call to that tool instead of a sentence. Setting `tool_choice` to name that tool
+specifically forces the model to always answer through it — confirmed against Anthropic's own API
+documentation (`platform.claude.com`, tool-use and "forcing tool use" pages, current as of this
+writing). Ask for a plan through a tool whose schema is an array of `{skill, args}` objects, and what
+comes back is JSON your code parses with `json.loads` — no prose to strip, no heuristics, one
+deterministic parsing step.
+
+What that schema buys is worth being precise about, because it is less than it might sound like. A
+schema describes the *shape* the response should take — `steps` as a list of objects, each with a
+`skill` string and an `args` object — not that the `skill` named is one the robot actually has, or
+that `args` fits that particular skill's expected fields and ranges. Shape is a syntax question;
+grounding and argument correctness are semantic ones, checked against the robot's own skill
+registry, which the model call has no way to enforce on itself.
+
+Claude does offer a stronger option, `strict: true`, which makes the API itself guarantee the
+returned arguments match the declared schema. This chapter's tool does not use it, for a reason
+worth knowing: strict mode requires every object in the schema to declare
+`additionalProperties: false`, and `args` here is an open map whose keys differ from one skill to the
+next — `walk_to` takes `x` and `y`, `place_on` takes `object_id` and `surface_id`. That is precisely
+the shape a strict schema cannot express. A design that fixed `args` per skill could use strict mode
+and would get its shape guarantee; it would still need everything the next section does, because
+shape was never the part in doubt. The tool schema below deliberately
+leaves `skill` typed as a plain string rather than an enum of the four known names, even though an
+enum would reduce how often the model proposes something ungrounded — precisely to keep that point
+sharp: no amount of schema-side constraint at the model call removes the need for an independent
+check against the robot's real, current skill registry. That check is the subject of the next
+section, and it is the one this chapter actually trusts.
+
+## Validating a plan before execution
+
+This is the chapter's central claim, and it is worth stating plainly: **the validator, not the
+model, is what makes this system safe.** An LLM call is a fallible, external, occasionally
+overconfident component — no different in kind from Whisper's willingness to return *some* text for
+any audio, mumbled or clear. The trust boundary this chapter builds sits between the model's raw
+output and the dispatcher that turns an accepted step into a ROS 2 call, the same place Chapter
+4.1 drew its boundary between a transcript and a published command — applied here to a *sequence* of
+steps instead of one phrase.
+
+A validator that only checks the plan "looks reasonable" is not a validator. At minimum, it must
+check, deterministically, for every step:
+
+1. **The skill is known.** Every `skill` name in the plan appears in the robot's own skill registry
+   — the grounding check from above, enforced independently of whatever the model was told.
+2. **The arguments are well-typed and in range.** A `walk_to` step's `x` and `y` must be numbers, and
+   numbers within whatever physical bounds the robot actually operates in — not merely present, and
+   not merely the right JSON type, but within range for a real robot in a real room.
+3. **The plan is bounded in length.** A ten-step plan for "bring me the cup" is a sign something went
+   wrong upstream, and an unbounded plan is an unbounded amount of robot behavior nobody reviewed. A
+   length cap turns a runaway plan into an outright rejection rather than a very long mistake.
+
+Malformed input — JSON that does not even parse — is the same class of failure as an ungrounded
+skill: something arrived that the dispatcher cannot act on, and the correct response is the same
+one Chapter 4.1 settled on for everything outside its bounded set: reject outright, with a specific,
+inspectable reason, and move nothing.
+
+## Failure and replanning
+
+Two different moments can go wrong, and they call for different responses.
+
+**Rejection before anything runs.** A plan that fails validation — ungrounded skill, bad argument,
+plan too long, malformed JSON — is caught before the dispatcher touches a single actuator. Nothing
+has moved, which is the same safe-by-default property Chapter 4.1 built into its bounded command
+table: a rejection is always a recoverable state. The system's response can be to try again: send the
+model the rejection reason as new context and ask for a corrected plan, the same way you would
+clarify a request to a person who misunderstood it. This chapter's code below does exactly that,
+capped at a small, fixed number of attempts — because an uncapped retry loop is just a slower version
+of the same runaway-plan risk the length bound above guards against. If every attempt is rejected,
+the system gives up cleanly: it logs why, and it dispatches nothing, rather than executing the least
+bad of several rejected plans.
+
+**Failure partway through execution.** A step can pass validation — a real skill, correct argument
+shape and range — and still fail when it actually runs: `pick_up(object_id="red_cup")` is grounded
+and well-typed, but the cup might not be where the robot expected. This is a different problem from a
+rejected plan, because by this point some of the plan has already executed and the world has already
+changed in ways the remaining steps did not anticipate. The mechanism is the same one used before
+anything ran — report the failure back to the planner as new context, and ask for a plan corrected
+for the world as it now is, bounded the same way — but building a full closed-loop executor that
+tracks partial progress and replans mid-sequence is a larger undertaking than this chapter's code
+takes on. The distinction is what matters here: a rejected plan costs nothing, because nothing moved
+before it was rejected; a failed step already spent some of its consequences, and any replan has to
+account for that.
+
+## Where VLA models fit
+
+Everything above keeps a hard boundary between *understanding and planning* — a language model
+operating purely on text, working from an instruction and a description of the robot's skills — and
+*perceiving and acting* — each individual skill, built from perception and control this book already
+taught: [Chapter 3.2](../isaac/isaac-ros-visual-slam.mdx)'s pose estimate,
+[Chapter 3.3](../isaac/nav2-path-planning.mdx)'s navigation action. A **Vision-Language-Action (VLA)**
+model collapses that boundary instead: it maps camera input and language directly onto low-level
+action — joint targets, end-effector motion — inside one learned model, with no intermediate plan of
+named skills at all.
+
+That collapse is a genuine trade-off, not a strict improvement. This chapter's approach keeps every
+step of a plan legible and checkable against an explicit, human-authored registry before anything
+moves — the validator above has something concrete to check because the plan names things a person
+defined in advance. A VLA model's action space lives implicitly in its training data; there is no
+equivalent list of "the skills it might propose" to validate a raw action against before it reaches
+an actuator. Training or fine-tuning a VLA model, and how that validation problem would be solved for
+one, is out of this chapter's scope — the point here is only to place the two approaches relative to
+each other, not to teach either one exhaustively.
+
+## Code example
+
+### Environment
+
+**ROS 2 Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**, **Python 3.12**, the `anthropic` package
+(`uv pip install anthropic` or `pip install anthropic`), and an `ANTHROPIC_API_KEY` set in the
+environment — never hardcoded. `example_interfaces`, for the `String` message type, ships with any
+ROS 2 Jazzy install, the same package this book has used since [Chapter 1.2](../ros2/ros2-architecture.mdx).
+
+As in [Chapter 4.1](./voice-to-action-whisper.mdx), the logic is split so the part that must be
+trustworthy needs nothing but the standard library to run and to test.
+
+### Example 1: the plan validator — pure Python, no ROS 2, no LLM SDK, no network
+
+Stage-independent of everything above it: a plan (already parsed from JSON text) and the robot's
+skill registry in, either an accepted, validated plan or an explicit rejection with a reason out. No
+`rclpy` import, no `anthropic` import, no network access of any kind — the same separation Chapter
+4.1 drew between deciding and publishing, and Chapter 1.3 drew before that, applied here to
+*validating* a plan versus *dispatching* one.
+
+**Status: executed and passing**, on Python 3.12.10 (`py -3.12`), standard library only.
+
+```python title="plan_validator.py"
+"""Pure Python, no ROS 2, no LLM SDK, no network.
+
+Validates a plan -- a JSON array of {"skill": ..., "args": {...}} steps --
+against a fixed skill registry (the robot's known primitives) before any
+step is allowed to reach a dispatcher. Never assumes an unknown skill
+means the nearest known one; an unrecognized skill is rejected outright,
+the same discipline Chapter 4.1 applied to an unrecognized transcript.
+"""
+
+import json
+from dataclasses import dataclass
+from typing import List, Optional
+
+# The robot's grounded skill vocabulary: every skill an LLM plan is allowed
+# to name, and the type/range every argument must satisfy. A plan step
+# naming anything outside this table is not grounded in what the robot can
+# actually do, no matter how reasonable it sounds.
+SKILL_REGISTRY = {
+    'walk_to': {
+        'x': {'type': 'float', 'min': -5.0, 'max': 5.0},
+        'y': {'type': 'float', 'min': -5.0, 'max': 5.0},
+    },
+    'pick_up': {
+        'object_id': {'type': 'str'},
+    },
+    'place_on': {
+        'object_id': {'type': 'str'},
+        'surface_id': {'type': 'str'},
+    },
+    'say': {
+        'text': {'type': 'str'},
+    },
+}
+
+# Bounds how long a plan may be, independent of whether every step is
+# individually valid -- a runaway plan is rejected on length alone.
+MAX_PLAN_STEPS = 6
+
+
+@dataclass
+class PlanResult:
+    accepted: bool
+    plan: Optional[List[dict]]
+    reason: str
+
+
+def validate_plan(plan_json, registry=None, max_steps=MAX_PLAN_STEPS):
+    """Parse and validate `plan_json` (a JSON string) against `registry`.
+
+    Returns a PlanResult: accepted=True with the validated step list, or
+    accepted=False with `plan=None` and a `reason` explaining exactly which
+    check failed. Checks, in order: the JSON parses; the top level is a
+    non-empty list; the list is within `max_steps`; every step names a
+    skill in `registry`; every step's arguments match that skill's
+    expected argument names exactly; every argument value matches its
+    declared type and, for numeric arguments, its declared range.
+    """
+    if registry is None:
+        registry = SKILL_REGISTRY
+
+    try:
+        steps = json.loads(plan_json)
+    except json.JSONDecodeError as exc:
+        return PlanResult(False, None, 'malformed_json: %s' % exc)
+
+    if not isinstance(steps, list):
+        return PlanResult(False, None, 'plan_not_a_list: got %s' % type(steps).__name__)
+
+    if len(steps) == 0:
+        return PlanResult(False, None, 'empty_plan')
+
+    if len(steps) > max_steps:
+        return PlanResult(
+            False, None,
+            'plan_too_long: %d steps exceeds max %d' % (len(steps), max_steps))
+
+    validated = []
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict) or 'skill' not in step or 'args' not in step:
+            return PlanResult(
+                False, None,
+                'malformed_step at index %d: expected {"skill": ..., "args": ...}' % index)
+
+        skill = step['skill']
+        args = step['args']
+
+        if skill not in registry:
+            return PlanResult(
+                False, None,
+                'ungrounded_skill at index %d: %r is not in the robot\'s skill registry' % (
+                    index, skill))
+
+        if not isinstance(args, dict):
+            return PlanResult(
+                False, None,
+                'malformed_step at index %d (%s): "args" is not an object' % (index, skill))
+
+        schema = registry[skill]
+        expected_names = set(schema.keys())
+        given_names = set(args.keys())
+        if given_names != expected_names:
+            return PlanResult(
+                False, None,
+                'bad_arguments at index %d (%s): expected %s, got %s' % (
+                    index, skill, sorted(expected_names), sorted(given_names)))
+
+        for name, spec in schema.items():
+            value = args[name]
+            if spec['type'] == 'float':
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    return PlanResult(
+                        False, None,
+                        'bad_argument_type at index %d (%s.%s): expected float, got %s' % (
+                            index, skill, name, type(value).__name__))
+                if not (spec['min'] <= value <= spec['max']):
+                    return PlanResult(
+                        False, None,
+                        'argument_out_of_range at index %d (%s.%s): %s not in [%s, %s]' % (
+                            index, skill, name, value, spec['min'], spec['max']))
+            elif spec['type'] == 'str':
+                if not isinstance(value, str) or not value:
+                    return PlanResult(
+                        False, None,
+                        'bad_argument_type at index %d (%s.%s): expected non-empty str, got %r'
+                        % (index, skill, name, value))
+
+        validated.append({'skill': skill, 'args': args})
+
+    return PlanResult(True, validated, 'ok: %d step(s) validated' % len(validated))
+
+
+if __name__ == '__main__':
+    cases = [
+        ('accepted: two-step "bring the cup" plan',
+         '[{"skill": "walk_to", "args": {"x": 1.5, "y": 0.5}},'
+         ' {"skill": "pick_up", "args": {"object_id": "red_cup"}}]'),
+        ('accepted: four-step "tidy the table" plan',
+         '[{"skill": "walk_to", "args": {"x": 1.0, "y": 2.0}},'
+         ' {"skill": "pick_up", "args": {"object_id": "red_cup"}},'
+         ' {"skill": "walk_to", "args": {"x": -1.0, "y": 0.0}},'
+         ' {"skill": "place_on", "args": {"object_id": "red_cup", "surface_id": "counter"}}]'),
+        ('rejected: ungrounded skill ("tidy_table" is not a primitive)',
+         '[{"skill": "tidy_table", "args": {}}]'),
+        ('rejected: bad argument type (x is a string, not a float)',
+         '[{"skill": "walk_to", "args": {"x": "far", "y": 0.0}}]'),
+        ('rejected: argument out of range (x = 100.0, outside +/-5.0 m)',
+         '[{"skill": "walk_to", "args": {"x": 100.0, "y": 0.0}}]'),
+        ('rejected: plan too long (7 steps, max is 6)',
+         '[' + ', '.join(['{"skill": "say", "args": {"text": "step"}}'] * 7) + ']'),
+        ('rejected: malformed JSON (truncated array)',
+         '[{"skill": "walk_to", "args": {"x": 1.0, "y": 2.0}}'),
+        ('rejected: missing required argument (walk_to with no y)',
+         '[{"skill": "walk_to", "args": {"x": 1.0}}]'),
+    ]
+
+    for description, plan_json in cases:
+        result = validate_plan(plan_json)
+        print('%s' % description)
+        print('  accepted=%-5s reason=%s' % (result.accepted, result.reason))
+        if result.accepted:
+            print('  plan=%s' % result.plan)
+        print()
+```
+
+Run with `py -3.12 plan_validator.py`, this printed, exactly, on the authoring machine:
+
+```text
+accepted: two-step "bring the cup" plan
+  accepted=True  reason=ok: 2 step(s) validated
+  plan=[{'skill': 'walk_to', 'args': {'x': 1.5, 'y': 0.5}}, {'skill': 'pick_up', 'args': {'object_id': 'red_cup'}}]
+
+accepted: four-step "tidy the table" plan
+  accepted=True  reason=ok: 4 step(s) validated
+  plan=[{'skill': 'walk_to', 'args': {'x': 1.0, 'y': 2.0}}, {'skill': 'pick_up', 'args': {'object_id': 'red_cup'}}, {'skill': 'walk_to', 'args': {'x': -1.0, 'y': 0.0}}, {'skill': 'place_on', 'args': {'object_id': 'red_cup', 'surface_id': 'counter'}}]
+
+rejected: ungrounded skill ("tidy_table" is not a primitive)
+  accepted=False reason=ungrounded_skill at index 0: 'tidy_table' is not in the robot's skill registry
+
+rejected: bad argument type (x is a string, not a float)
+  accepted=False reason=bad_argument_type at index 0 (walk_to.x): expected float, got str
+
+rejected: argument out of range (x = 100.0, outside +/-5.0 m)
+  accepted=False reason=argument_out_of_range at index 0 (walk_to.x): 100.0 not in [-5.0, 5.0]
+
+rejected: plan too long (7 steps, max is 6)
+  accepted=False reason=plan_too_long: 7 steps exceeds max 6
+
+rejected: malformed JSON (truncated array)
+  accepted=False reason=malformed_json: Expecting ',' delimiter: line 1 column 52 (char 51)
+
+rejected: missing required argument (walk_to with no y)
+  accepted=False reason=bad_arguments at index 0 (walk_to): expected ['x', 'y'], got ['x']
+```
+
+Read the two accepted cases against the theory above: "tidy the table" comes back as a four-step plan
+— walk, pick up, walk, place — none of which the instruction spelled out explicitly, which is the
+composition a planner does that a lookup table cannot. Every rejected case shows the validator
+catching exactly one class of problem this chapter named: an invented skill, a wrong argument type, a
+value outside the robot's physical envelope, a plan too long to be a reasonable single request, and
+JSON that never parsed at all. None of them require running a language model to demonstrate — this
+validator's job is to be correct regardless of what produced the plan.
+
+### Example 2: the planning call and the ROS 2 dispatcher
+
+This wraps the validator above with the two things it cannot do on its own: asking Claude to propose
+a plan for an instruction, and, once a plan is accepted, publishing each step for a downstream ROS 2
+node to execute. It also adds the bounded replanning loop described above: if a plan is rejected, the
+rejection reason is sent back to the model as new context, up to a small number of attempts, before
+the node gives up and dispatches nothing.
+
+**Status: `pending-env`. Environment required: ROS 2 Jazzy for `rclpy`/`example_interfaces`, the
+`anthropic` package, and network access to the Claude API with `ANTHROPIC_API_KEY` set.** The
+authoring machine is Windows with neither ROS 2 nor network access to a model API available in this
+session; per this chapter's own instructions, no attempt was made to install the `anthropic` SDK or
+call the API from here. `python -m py_compile` confirms the file parses; the model call and the
+publish were never observed to run. The tool-use API shape below — `tools`, `input_schema`,
+`tool_choice={"type": "tool", "name": ...}`, and reading a `tool_use` block's `.input`
+off `response.content` — was verified against Anthropic's own API documentation
+(`platform.claude.com`, "Tool use with Claude" and "Define tools" pages) rather than assumed; the
+plan JSON shown below for the "tidy the table" instruction is traced by hand from that verified shape
+and this node's own logic, not observed from a real call.
+
+```python title="cognitive_planner_node.py"
+"""Turns a natural-language instruction into a validated plan of known
+robot skills, using Claude as the planner, and dispatches each accepted
+step onto ROS 2. Rejected plans are retried a bounded number of times by
+feeding the rejection reason back to the model as new context; if every
+attempt is rejected, nothing is dispatched.
+
+Usage: python3 cognitive_planner_node.py "INSTRUCTION"
+
+Environment: ROS 2 Jazzy Jalisco, Ubuntu 24.04, Python 3.12, the
+anthropic package, and ANTHROPIC_API_KEY set in the environment.
+"""
+
+import json
+import sys
+
+import anthropic
+
+import rclpy
+from rclpy.node import Node
+
+from example_interfaces.msg import String
+
+from plan_validator import validate_plan
+
+MODEL = 'claude-sonnet-5'
+MAX_REPLAN_ATTEMPTS = 2
+
+# The tool Claude is forced to answer through. `skill` is deliberately a
+# plain string, not an enum of the four known names -- constraining it
+# here would only reduce, not remove, the chance of an ungrounded plan,
+# and this chapter's point is that the validator's check against the
+# robot's real skill registry is the one actually trusted, not whatever
+# the model was told at the API boundary.
+#
+# Note there is no `strict: True` here. Claude's strict mode requires
+# every object in the schema to declare `additionalProperties: False`,
+# and `args` is an open map whose keys differ per skill -- exactly the
+# shape a strict schema cannot express. The schema below is a request,
+# not a guarantee; validate_plan is what enforces it.
+PLAN_TOOL = {
+    'name': 'propose_plan',
+    'description': (
+        'Propose an ordered plan of robot skills that accomplishes the '
+        "user's instruction. Known skills: walk_to(x, y), "
+        'pick_up(object_id), place_on(object_id, surface_id), say(text).'
+    ),
+    'input_schema': {
+        'type': 'object',
+        'properties': {
+            'steps': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'properties': {
+                        'skill': {'type': 'string'},
+                        'args': {'type': 'object'},
+                    },
+                    'required': ['skill', 'args'],
+                },
+            },
+        },
+        'required': ['steps'],
+    },
+}
+
+
+def request_plan_with_replanning(instruction, max_attempts=MAX_REPLAN_ATTEMPTS):
+    """Ask Claude for a plan, validate it, and retry with the rejection
+    reason as context if validation fails -- up to max_attempts times.
+    Returns the last PlanResult, accepted or not.
+    """
+    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+    messages = [{'role': 'user', 'content': instruction}]
+    outcome = None
+
+    for attempt in range(1, max_attempts + 1):
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            tools=[PLAN_TOOL],
+            tool_choice={'type': 'tool', 'name': 'propose_plan'},
+            messages=messages,
+        )
+        tool_use = next(block for block in response.content if block.type == 'tool_use')
+        plan_json = json.dumps(tool_use.input['steps'])
+
+        outcome = validate_plan(plan_json)
+        if outcome.accepted:
+            return outcome
+
+        messages.append({'role': 'assistant', 'content': response.content})
+        messages.append({
+            'role': 'user',
+            'content': (
+                'That plan was rejected by the robot\'s validator: %s. '
+                'Propose a corrected plan.' % outcome.reason
+            ),
+        })
+
+    return outcome
+
+
+class CognitivePlannerNode(Node):
+
+    def __init__(self, instruction):
+        super().__init__('cognitive_planner_node')
+        self._instruction = instruction
+        self._publisher = self.create_publisher(String, 'robot_plan_step', 10)
+
+    def plan_and_dispatch(self):
+        self.get_logger().info('instruction: %r' % self._instruction)
+        outcome = request_plan_with_replanning(self._instruction)
+
+        if not outcome.accepted:
+            self.get_logger().warning(
+                'plan rejected after %d attempt(s): %s' % (MAX_REPLAN_ATTEMPTS, outcome.reason))
+            return
+
+        self.get_logger().info('plan accepted: %s' % outcome.reason)
+        for index, step in enumerate(outcome.plan):
+            msg = String()
+            msg.data = json.dumps(step)
+            self._publisher.publish(msg)
+            self.get_logger().info('dispatched step %d: %s' % (index, msg.data))
+
+
+def main(args=None):
+    if len(sys.argv) < 2:
+        print('usage: cognitive_planner_node.py "INSTRUCTION"')
+        raise SystemExit(1)
+
+    instruction = sys.argv[1]
+
+    rclpy.init(args=args)
+    node = CognitivePlannerNode(instruction)
+    node.plan_and_dispatch()
+    # Same reasoning as Chapter 4.1's voice_command_node: no subscriber-side
+    # work for this node to wait on, so a bounded spin_once hands the
+    # published messages off before shutdown, rather than a spin() that
+    # would never return.
+    rclpy.spin_once(node, timeout_sec=1.0)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+Run against the instruction that opened this chapter —
+
+```bash
+source /opt/ros/jazzy/setup.bash
+export ANTHROPIC_API_KEY=...   # never hardcoded
+python3 cognitive_planner_node.py "tidy the table"
+```
+
+— this would log, traced by hand from the verified API shape and this node's own logic, not
+observed:
+
+```text
+[INFO] [cognitive_planner_node]: instruction: 'tidy the table'
+[INFO] [cognitive_planner_node]: plan accepted: ok: 4 step(s) validated
+[INFO] [cognitive_planner_node]: dispatched step 0: {"skill": "walk_to", "args": {"x": 1.0, "y": 2.0}}
+[INFO] [cognitive_planner_node]: dispatched step 1: {"skill": "pick_up", "args": {"object_id": "red_cup"}}
+[INFO] [cognitive_planner_node]: dispatched step 2: {"skill": "walk_to", "args": {"x": -1.0, "y": 0.0}}
+[INFO] [cognitive_planner_node]: dispatched step 3: {"skill": "place_on", "args": {"object_id": "red_cup", "surface_id": "counter"}}
+```
+
+and, in a second terminal, `ros2 topic echo /robot_plan_step` would show one `data:` line per
+dispatched step, in the same order. What turns a dispatched `walk_to` step into an actual walk is not
+new material: a downstream node translating `robot_plan_step` messages into `NavigateToPose` goals is
+exactly the action-client pattern [Chapter 3.3](../isaac/nav2-path-planning.mdx) already built, aimed
+at a new source. This chapter stops at publishing the validated step, the same boundary
+[Chapter 4.1](./voice-to-action-whisper.mdx) drew at publishing a validated command.
+
+A rejected instruction — say, one whose first attempt names a skill outside the registry — would
+instead show the replanning loop working before giving up:
+
+```text
+[INFO] [cognitive_planner_node]: instruction: 'sort the recycling by material'
+[WARN] [cognitive_planner_node]: plan rejected after 2 attempt(s): ungrounded_skill at index 0: 'sort_by_material' is not in the robot's skill registry
+```
+
+Nothing was published in that run. A rejected plan, replanned or not, always ends the same way this
+chapter's central claim demands: no accepted step, no publish, no motion.
+
+## Exercises
+
+**1. Add a skill, and confirm the registry gates it correctly.** In `plan_validator.py`, add
+`'wave': {}` to `SKILL_REGISTRY` (a skill that takes no arguments). Call `validate_plan` on
+`'[{"skill": "wave", "args": {}}]'` and on `'[{"skill": "wave", "args": {"hand": "left"}}]'`.
+*Correct result*: the first returns `accepted=True`; the second returns `accepted=False`, with
+`reason` starting `bad_arguments` — an argument the skill does not declare is rejected exactly like
+a missing one, because the check compares the argument names given against the schema's exactly, not
+just "have enough."
+
+**2. Find the plan-length boundary exactly.** Using the unmodified `SKILL_REGISTRY`, build plans of
+5, 6, and 7 identical `say` steps (`{"skill": "say", "args": {"text": "x"}}` repeated) and call
+`validate_plan` on each as a JSON string.
+*Correct result*: 5 and 6 steps are accepted, 7 is rejected with `plan_too_long` — read
+`validate_plan`'s `len(steps) > max_steps` check to see why 6 lands on the accepted side, not the
+rejected one.
+
+**3. Diagnose two different rejections, without changing the code.** `'[{"skill": "walk_to", "args": {"x": 1.0, "y": 2.0, "speed": "fast"}}]'`
+and `'[{"skill": "fly_to", "args": {"x": 1.0, "y": 2.0}}]'` are both rejected by the unmodified
+validator, for different reasons. State which one is a grounding failure and which is an argument
+failure, and why only one of the two could ever be fixed by adding an entry to `SKILL_REGISTRY`.
+*Correct result*: `fly_to` is a grounding failure — `ungrounded_skill`, since no such skill exists —
+and could be "fixed" only by deciding the robot should actually have a `fly_to` skill, a real design
+decision, not a bug. The `walk_to` case is an argument failure — `bad_arguments`, an extra `speed`
+key `walk_to` does not declare — and is fixed by either dropping `speed` from the call or extending
+`walk_to`'s own schema to accept it; the skill itself is already grounded.
+
+**4. Trace the replanning loop by hand.** Using `request_plan_with_replanning`'s logic (not by
+running it), suppose the first call to Claude returns a plan that validates as `accepted=False`, and
+the second call — sent with the rejection reason appended to `messages` — returns a plan that
+validates as `accepted=True`. With `MAX_REPLAN_ATTEMPTS = 2`, write out what `plan_and_dispatch` logs,
+in order.
+*Correct result*: one `instruction:` line, then no rejection warning (the first attempt's failure is
+silent inside the loop, only the final outcome is logged), then `plan accepted: ...` followed by one
+`dispatched step ...` line per step in the second attempt's plan. If the second attempt had also
+failed, the log would instead end with a single `plan rejected after 2 attempt(s): ...` line and no
+dispatched steps at all.
+
+---
+
+The humanoid can now turn a goal that names no primitive at all into a sequence of primitives it
+already has, checked step by step against exactly what it can do before any of it moves — the same
+discipline [Chapter 4.1](./voice-to-action-whisper.mdx) built for one word, now built for a plan.
+What still has not been built is the rest of the loop: turning a dispatched step into an actual
+Nav2 goal or gripper motion, watching that execution for the kind of runtime failure this chapter
+only described, and assembling every layer this book has taught — perception, navigation, voice,
+planning — into one system a spoken sentence can drive end to end. That assembly, built from pieces
+this chapter and every one before it already earned, is the book's **capstone**.
