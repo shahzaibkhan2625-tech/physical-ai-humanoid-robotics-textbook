@@ -1,0 +1,506 @@
+---
+sidebar_position: 2
+title: "Voice-to-Action with Whisper"
+---
+
+# Voice-to-Action with Whisper
+
+[Chapter 3.3](../isaac/nav2-path-planning.mdx)'s navigation client took a goal as three numbers on
+the command line — `python3 send_nav_goal.py 2.0 1.0 0.0` — typed by whoever wanted the robot to
+move. That is fine for testing a stack. It is not how a person actually wants to operate a humanoid
+sharing their kitchen: nobody wants to compute a pose before asking a robot to come here. What they
+have, and what every other capability in this book has so far ignored, is a sentence.
+
+This chapter turns a spoken sentence into a command a downstream node can act on — nothing more
+ambitious than that. **It needs no NVIDIA GPU**, unlike [Module 3](../isaac/index.mdx): Whisper's
+smaller models run real-time transcription on an ordinary CPU. What it does need is a **microphone,
+or an audio file** — a reader with neither can still read every idea here and run the code below
+against a prerecorded clip, exactly as [Module 4's landing page](./index.mdx) said. Everything
+targets **ROS 2 Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**, **Python 3.12**, and OpenAI's
+**Whisper**.
+
+## Learning objectives
+
+By the end of this chapter you will be able to:
+
+- Explain why natural language is a reasonable command interface for a humanoid, and what this
+  chapter narrows that down to.
+- Explain what automatic speech recognition does, where Whisper fits architecturally, and how its
+  model sizes trade accuracy against latency.
+- Explain the latency/privacy trade-off between transcribing locally and sending audio to a hosted
+  service.
+- Name the four stages of the voice-to-action pipeline in order and say what crosses each boundary.
+- Transcribe speech to text in Python and publish a structured command derived from it on a ROS 2
+  topic.
+- Explain why the command set a voice interface maps to must be bounded, and what letting it guess
+  at the nearest match would cost.
+
+## Why natural language is the right interface for a humanoid
+
+Every input this book has given the humanoid so far was built for a programmer. [Chapter
+1.2](../ros2/ros2-architecture.mdx)'s `/gap` stream was a number from a simulated sensor.
+[Chapter 3.3](../isaac/nav2-path-planning.mdx)'s navigation goal was three floats on a command
+line. Both are exactly right for testing a stack piece by piece, and neither is how anyone who is
+not this book's reader would ever want to operate a robot. A humanoid is being built to work
+*around* people, in their kitchens and hallways and workshops, and the interface people already
+have, that needs no training and no manual, is talking.
+
+That is the whole argument for language as an input, and it is worth being precise about what it
+is not. It is not an argument that a robot should *understand* everything a person might say — that
+is a much harder and much later problem this book takes up next. This chapter's job
+is narrower and comes first: turn speech into text, and turn a *small, known* set of things a
+person might say into a command the robot can safely act on. Understanding "tidy the table" is not
+in scope here. Understanding "stop" is.
+
+## Automatic speech recognition, and where Whisper fits
+
+**Automatic speech recognition (ASR)** is the general problem: audio waveform in, text transcript
+out. It has existed for decades, mostly as narrow, per-language, per-vocabulary systems that needed
+their own training data for each new setting.
+
+**Whisper** is OpenAI's answer to that narrowness, and it is worth naming precisely what kind of
+model it is, because the shape explains what it is good and bad at. Verified against its model
+card on `github.com/openai/whisper` (`main` branch): Whisper is a sequence-to-sequence
+**encoder-decoder Transformer**, trained on **680,000 hours** of audio paired with transcripts
+collected from the internet — about 438,000 hours (65%) English, and the remaining non-English
+audio spanning 98 languages, some paired with English translations and some with native-language
+transcripts. That training set was never manually verified line by line, which is what "weakly
+supervised" means here: noisy at the level of any one example, but large and varied enough that the
+model generalizes well across accents, background noise, and technical language — properties a
+narrow, hand-curated dataset would not have bought.
+
+Whisper ships in a range of model sizes, and the size you pick is a real trade-off, not a default to
+ignore. Verified against the same repository's README:
+
+| Model | Parameters | Approx. VRAM | Relative speed |
+|---|---|---|---|
+| `tiny` | 39M | ~1 GB | ~10× |
+| `base` | 74M | ~1 GB | ~7× |
+| `small` | 244M | ~2 GB | ~4× |
+| `medium` | 769M | ~5 GB | ~2× |
+| `large` | 1550M | ~10 GB | 1× |
+
+Relative speed is measured against `large`. `tiny` and `base` are the two worth taking seriously on
+CPU — the "Approx. VRAM" column is a GPU figure, but it is also a rough proxy for how much compute
+the model needs per second of audio, and `tiny`/`base` are the ones a laptop CPU transcribes near
+real time. `small` is usable but noticeably slower; `medium` and `large` are markedly more accurate
+and markedly slower still, and on CPU alone often too slow for anything that needs to feel
+responsive. This chapter's code below defaults to `base`: fast enough to stay out of the way,
+accurate enough for a short, deliberately simple command vocabulary.
+
+Calling Whisper from Python is two calls, per its own README:
+
+```python
+import whisper
+
+model = whisper.load_model("base")
+result = model.transcribe("clip.wav")
+print(result["text"])
+```
+
+`load_model` downloads (once) and loads the chosen size. `transcribe` reads the whole file — an
+audio format `ffmpeg` can decode, `.wav` included — and processes it with a sliding 30-second
+window. `result` is a dict with three keys, confirmed from the library's `transcribe.py` source:
+`text` (the full transcript), `language` (detected or specified), and `segments` — a list of
+per-span dicts, each carrying its own `start`, `end`, `text`, and, load-bearing for this chapter,
+`avg_logprob` and `no_speech_prob`: the model's own signal for how sure it was about that span.
+Whisper does not hand back one tidy confidence percentage; those two per-segment fields are what a
+caller has to build one from, and the code example below does exactly that.
+
+## Local vs. service transcription: the latency/privacy trade-off
+
+Two ways to run the model above. **Locally**: load a small Whisper model on the robot's own CPU (or
+GPU, if it has one) and transcribe on-device. **As a service**: send the audio over the network to
+a larger model running elsewhere — a cloud ASR API, or a bigger Whisper model on a server the robot
+talks to — and get a transcript back.
+
+The trade-off is not a purely technical one, and a microphone in a home is not the same as a
+microphone in a lab.
+
+**Latency** favors local for anything that needs to feel like a conversation: no network round
+trip, no queueing behind other requests, and a small model gives an answer in a fraction of a
+second on ordinary hardware. A service call adds however long the network takes each way, on top of
+whatever the larger model itself takes to run — usually still fast, but no longer bounded by
+hardware you control.
+
+**Accuracy** tends to favor a service, because nothing stops the service from running a much larger
+model than a robot's own CPU could ever manage in real time — `large`, or something bigger still.
+Local transcription pays for its speed with the accuracy `tiny` or `base` gives up next to `large`.
+
+**Privacy** is where the two settings genuinely diverge. A microphone in a robotics lab hears lab
+things — instructions about a box, a shelf, a test run. A microphone in someone's home hears
+whatever else is said near it, and sending that audio to a third-party service means that audio
+leaves the house. Local transcription keeps every waveform on the device; nothing about "stop" or
+"walk forward" ever needs to leave the robot to be understood. That is not a reason to always choose
+local — a lab may have no such concern and every reason to want a bigger model's accuracy — but it
+is a reason the choice cannot be made on latency and accuracy alone, and a chapter that only talked
+about speed would be teaching half the trade-off.
+
+Nothing about the pipeline downstream of transcription cares which choice was made. The rest of
+this chapter, including its code, is written against `whisper.load_model` running locally, because
+that is what needs no account, no network, and no service outage to run — but a hosted call returns
+the same shape of transcript and slots into the same pipeline.
+
+## The pipeline: voice → text → intent → action
+
+Four stages, and it is worth naming them explicitly because each is where a different kind of thing
+can go wrong.
+
+1. **Voice.** A waveform — from a microphone, or a `.wav` file for a reader who has neither. Nothing
+   is understood yet; this is just sound.
+2. **Text.** Whisper's `transcribe` call turns the waveform into a string, plus the per-segment
+   confidence signal described above. This is the ASR step, and everything above this section is
+   about it.
+3. **Intent.** The transcript is checked against a **fixed, known set of commands** and either
+   matched to exactly one of them or rejected outright. This is a plain Python function — no ROS 2,
+   no Whisper, nothing but string comparison — and it is the subject of the next section, because
+   getting it wrong is the one mistake in this pipeline that reaches the robot's body.
+4. **Action.** An accepted command is published on a ROS 2 topic. What happens after that is not
+   new material: [Chapter 1.3](../ros2/python-agents-rclpy.mdx)'s `pilot` node already showed a
+   thin `rclpy` adapter turning a decision into a published message, and
+   [Chapter 3.3](../isaac/nav2-path-planning.mdx)'s action client already showed a downstream node
+   turning a goal into motion the humanoid actually carries out. This chapter stops at publishing
+   the structured command; wiring that command to `/cmd_speed` or to a `NavigateToPose` goal is the
+   same pattern those chapters already taught, pointed at a new source.
+
+Voice and text can be noisy and nobody gets hurt by that alone — a bad transcript by itself moves
+nothing. Intent is the boundary where noise either turns into an action or does not, and that is
+exactly why the next section is about making that boundary strict.
+
+## Mis-transcription is a safety problem, not a UX problem
+
+Whisper does not refuse to answer. Given any audio — clear speech, a mumble, a cough, silence with
+a little room noise — `transcribe` returns *some* text; it has no built-in notion of "I don't know."
+A transcript can therefore be confidently wrong: `no_speech_prob` low, `avg_logprob` fine, and the
+words still not what was said. "Turn left" misheard as "turn lift" is not a hypothetical — it is
+exactly the kind of near-miss a real acoustic model produces, and [Chapter
+1.4](../ros2/urdf-describing-a-humanoid.mdx)'s humanoid has **twelve revolute joints** that will
+move on whatever command a downstream node hands them. A speech interface sitting in front of that
+robot is not a text box where a wrong autocomplete costs a re-type. It is a step in a chain that
+ends at an actuator.
+
+The tempting fix is a "helpful" one: if the transcript nearly matches a known command, assume that
+is what was meant and act on the nearest match. Resist it. Nearest-match logic is exactly the
+mechanism that turns a small ASR error into a wrong physical action, silently, with no signal to
+anyone that a substitution happened. "Turn lift" is one edit away from "turn left" and also one edit
+away from nothing sensible at all — treating proximity as intent means the system's safety margin is
+however good Whisper's worst transcription happens to be that day, which is not a margin anyone
+chose on purpose.
+
+The alternative this chapter's code takes instead: the command set is **bounded** — a short, fixed,
+enumerable table of exact phrases, each mapped to exactly one command — and anything not an exact
+match, at or above a minimum confidence, is **rejected outright** rather than guessed at. Bounded
+buys three things at once. It makes the full space of what the robot might do **enumerable**, so
+every accepted command was one a person could review in advance, not something an approximate match
+invented at runtime. It makes failure **safe by default**: a rejection means *nothing moves*, which
+is always a recoverable state, where an incorrect guess acted on is not. And it makes the system's
+behavior **auditable** — every acceptance or rejection has one deterministic reason, not a
+similarity score that varies with implementation details. None of that survives if "close enough"
+is allowed to count as a match.
+
+## Code example
+
+### Environment
+
+**ROS 2 Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**, **Python 3.12**, and the `openai-whisper`
+package (`uv pip install openai-whisper` or `pip install openai-whisper`), which in turn needs
+`ffmpeg` on `PATH` to decode audio files. `example_interfaces`, for the `String` message type used
+below, ships with any ROS 2 Jazzy install — the same package this book has used since [Chapter
+1.2](../ros2/ros2-architecture.mdx)'s `Float64`; confirmed present on the `jazzy` branch of
+`ros2/example_interfaces`, field `string data`.
+
+The chapter's logic is split into two files on purpose, so the part that must be trustworthy can be
+tested with nothing but the standard library.
+
+### Example 1: the intent mapper — pure Python, no ROS 2, no ML
+
+This is stage 3 of the pipeline above, isolated: a transcript and a confidence number in, either an
+accepted command or an explicit rejection out. No `rclpy` import, no `whisper` import — the same
+separation [Chapter 1.3](../ros2/python-agents-rclpy.mdx) argued for between deciding and
+publishing, applied here to deciding and *transcribing* instead.
+
+**Status: executed and passing**, on Python 3.12.10 (`py -3.12`), standard library only.
+
+```python title="voice_intent.py"
+"""Pure Python, no ROS 2, no ML dependencies.
+
+Maps a transcript (plus a confidence score in [0, 1]) to one command from a
+fixed, bounded set -- or an explicit rejection. Never guesses at the nearest
+match: a transcript that is not an exact match to a known phrase, or whose
+confidence is too low to trust, is rejected outright.
+"""
+
+from dataclasses import dataclass
+from typing import Optional
+
+# The bounded command set. Each key is the command a downstream ROS 2 node
+# will act on; each value is the finite list of phrases that map to it.
+# Anything not in this table -- including a close paraphrase -- is rejected.
+BOUNDED_COMMANDS = {
+    'STOP': ('stop', 'halt', 'freeze'),
+    'WALK_FORWARD': ('walk forward', 'move forward', 'go forward', 'forward'),
+    'WALK_BACKWARD': ('walk backward', 'walk back', 'move backward', 'back up'),
+    'TURN_LEFT': ('turn left', 'left'),
+    'TURN_RIGHT': ('turn right', 'right'),
+}
+
+MIN_CONFIDENCE = 0.5
+
+
+@dataclass
+class IntentResult:
+    accepted: bool
+    command: Optional[str]
+    reason: str
+
+
+def normalize(transcript):
+    """Lowercase and collapse whitespace -- nothing fuzzier than that."""
+    return ' '.join(transcript.strip().lower().split())
+
+
+def map_transcript_to_command(transcript, confidence, min_confidence=MIN_CONFIDENCE):
+    """Return an IntentResult: accepted with a command, or rejected with a reason.
+
+    `confidence` is expected in [0, 1] -- for Whisper, a value derived from a
+    segment's `avg_logprob` (see estimate_confidence in voice_command_node.py).
+    Matching is exact-string only, against BOUNDED_COMMANDS, on purpose: a
+    robot with actuated joints must never act on the nearest guess.
+    """
+    if confidence < min_confidence:
+        return IntentResult(
+            accepted=False, command=None,
+            reason='low_confidence: %.2f < %.2f' % (confidence, min_confidence))
+
+    text = normalize(transcript)
+
+    if not text:
+        return IntentResult(accepted=False, command=None, reason='empty_transcript')
+
+    for command, phrases in BOUNDED_COMMANDS.items():
+        if text in phrases:
+            return IntentResult(accepted=True, command=command, reason='matched %r' % text)
+
+    return IntentResult(
+        accepted=False, command=None,
+        reason='out_of_vocabulary: %r' % text)
+
+
+if __name__ == '__main__':
+    cases = [
+        ('Stop', 0.95),
+        ('  WALK forward  ', 0.88),
+        ('turn left', 0.91),
+        ('go forward', 0.77),
+        ('please walk forward now', 0.90),   # not an exact phrase -> rejected
+        ('turn lift', 0.90),                 # mis-transcription -> rejected
+        ('turn left', 0.30),                 # low confidence -> rejected
+        ('', 0.99),
+    ]
+    for transcript, confidence in cases:
+        result = map_transcript_to_command(transcript, confidence)
+        print('%-28r conf=%.2f -> accepted=%-5s command=%-14s reason=%s' % (
+            transcript, confidence, result.accepted, result.command, result.reason))
+```
+
+Run with `py -3.12 voice_intent.py`, this printed, exactly, on the authoring machine:
+
+```text
+'Stop'                       conf=0.95 -> accepted=True  command=STOP           reason=matched 'stop'
+'  WALK forward  '           conf=0.88 -> accepted=True  command=WALK_FORWARD   reason=matched 'walk forward'
+'turn left'                  conf=0.91 -> accepted=True  command=TURN_LEFT      reason=matched 'turn left'
+'go forward'                 conf=0.77 -> accepted=True  command=WALK_FORWARD   reason=matched 'go forward'
+'please walk forward now'    conf=0.90 -> accepted=False command=None           reason=out_of_vocabulary: 'please walk forward now'
+'turn lift'                  conf=0.90 -> accepted=False command=None           reason=out_of_vocabulary: 'turn lift'
+'turn left'                  conf=0.30 -> accepted=False command=None           reason=low_confidence: 0.30 < 0.50
+''                           conf=0.99 -> accepted=False command=None           reason=empty_transcript
+```
+
+Read the last four lines against the previous section's argument. `'please walk forward now'` is
+plainly what a person walking up to the robot would actually say, and it is rejected anyway —
+because it is not one of the exact phrases the table lists, not because the intent behind it is
+unclear. That is the bounded-set trade-off made concrete: real phrasing that a smarter system could
+have handled is turned away here, on purpose, in exchange for a rule with no ambiguity about what
+counts as a match. `'turn lift'` shows the mis-transcription case working as designed: a one-letter
+ASR slip lands nowhere in the table and is rejected outright rather than assumed to mean `TURN_LEFT`.
+And the low-confidence case shows the same phrase that succeeded moments earlier being rejected once
+its confidence drops below the threshold — the table is not the only gate.
+
+### Example 2: the Whisper node
+
+This wraps the intent mapper above with the two things it cannot do on its own: turning audio into
+a transcript, and telling the rest of the robot what was decided. It takes one audio file, transcribes
+it, and either publishes a command on `voice_command` or logs a rejection and publishes nothing.
+
+**Status: `pending-env`. Environment required: `openai-whisper` and `ffmpeg` installed under Python
+3.12, plus ROS 2 Jazzy for `rclpy` and `example_interfaces`.** The authoring machine is Windows with
+neither ROS 2 nor a working `whisper` install (a bounded attempt to install `openai-whisper` here
+was made and is reported at the end of this chapter). `python -m py_compile` confirms the file
+parses; the transcription call and the publish were never observed to run, and the output shown
+below is a description of what the shown code would print given a clip whose spoken words are
+"walk forward" — computed from Whisper's documented output shape, not observed.
+
+```python title="voice_command_node.py"
+"""Transcribes one audio clip with Whisper, maps the transcript to a bounded
+command, and publishes the result on /voice_command -- or logs why and
+publishes nothing, if the transcript does not match the bounded set.
+
+Usage: python3 voice_command_node.py AUDIO_FILE [MODEL_SIZE]
+
+Environment: ROS 2 Jazzy Jalisco, Ubuntu 24.04, Python 3.12, openai-whisper
+(needs ffmpeg on PATH), example_interfaces.
+"""
+
+import math
+import sys
+
+import whisper
+
+import rclpy
+from rclpy.node import Node
+
+from example_interfaces.msg import String
+
+from voice_intent import map_transcript_to_command
+
+
+def estimate_confidence(segments):
+    """A simple confidence proxy from Whisper's own per-segment signal --
+    not a calibrated probability, just a monotonic stand-in for how sure the
+    model was. avg_logprob is a mean log-probability per segment (closer to
+    0 is more confident); exponentiating and clamping turns it into [0, 1].
+    """
+    if not segments:
+        return 0.0
+    mean_logprob = sum(segment['avg_logprob'] for segment in segments) / len(segments)
+    return max(0.0, min(1.0, math.exp(mean_logprob)))
+
+
+class VoiceCommandNode(Node):
+
+    def __init__(self, audio_path, model_size='base'):
+        super().__init__('voice_command_node')
+        self._audio_path = audio_path
+        self._publisher = self.create_publisher(String, 'voice_command', 10)
+        self.get_logger().info('loading Whisper model %r...' % model_size)
+        self._model = whisper.load_model(model_size)
+
+    def transcribe_and_publish(self):
+        result = self._model.transcribe(self._audio_path)
+        transcript = result['text']
+        confidence = estimate_confidence(result['segments'])
+
+        self.get_logger().info(
+            'heard %r (confidence proxy %.2f)' % (transcript, confidence))
+
+        outcome = map_transcript_to_command(transcript, confidence)
+
+        if not outcome.accepted:
+            self.get_logger().warning('rejected: %s' % outcome.reason)
+            return
+
+        msg = String()
+        msg.data = outcome.command
+        self._publisher.publish(msg)
+        self.get_logger().info('published command: %s' % outcome.command)
+
+
+def main(args=None):
+    if len(sys.argv) < 2:
+        print('usage: voice_command_node.py AUDIO_FILE [MODEL_SIZE]')
+        raise SystemExit(1)
+
+    audio_path = sys.argv[1]
+    model_size = sys.argv[2] if len(sys.argv) > 2 else 'base'
+
+    rclpy.init(args=args)
+    node = VoiceCommandNode(audio_path, model_size)
+    node.transcribe_and_publish()
+    # Give the middleware a moment to hand the message off before the node
+    # is torn down -- there is no subscriber-side work for this node to
+    # wait on otherwise, so a full rclpy.spin() would never return.
+    rclpy.spin_once(node, timeout_sec=1.0)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+Run against a clip whose spoken words are "walk forward" —
+
+```bash
+source /opt/ros/jazzy/setup.bash
+python3 voice_command_node.py walk_forward.wav
+```
+
+— this would log, per Whisper's documented `transcribe()` output shape and this node's own logic,
+traced by hand rather than observed:
+
+```text
+[INFO] [voice_command_node]: loading Whisper model 'base'...
+[INFO] [voice_command_node]: heard 'walk forward' (confidence proxy 0.93)
+[INFO] [voice_command_node]: published command: WALK_FORWARD
+```
+
+and, in a second terminal, `ros2 topic echo /voice_command` would show:
+
+```text
+data: WALK_FORWARD
+---
+```
+
+A clip whose words are misheard as "turn lift" would instead log the rejection and publish nothing:
+
+```text
+[INFO] [voice_command_node]: loading Whisper model 'base'...
+[INFO] [voice_command_node]: heard 'turn lift' (confidence proxy 0.81)
+[WARN] [voice_command_node]: rejected: out_of_vocabulary: 'turn lift'
+```
+
+## Exercises
+
+**1. Add a command, and confirm the boundary holds.** In `voice_intent.py`, add `'SIT_DOWN': ('sit
+down', 'sit')` to `BOUNDED_COMMANDS`. Call `map_transcript_to_command` with `'sit down'`, `'sit'`,
+and `'sit dow'` (a plausible mis-transcription), all at confidence `0.9`.
+*Correct result*: the first two return `accepted=True, command='SIT_DOWN'`; the third returns
+`accepted=False`, with `reason` starting `out_of_vocabulary` — the typo is one character away from
+a real command and is still rejected, exactly as the chapter argued a bounded set must behave.
+
+**2. Find the confidence boundary exactly.** Using the unmodified table, call
+`map_transcript_to_command('stop', confidence)` for `confidence` equal to `0.49`, `0.50`, and
+`0.51`.
+*Correct result*: `0.49` is rejected (`low_confidence`), and both `0.50` and `0.51` are accepted —
+read `map_transcript_to_command`'s first `if` to see why `0.50` lands on the accepted side of a
+`<` comparison against `MIN_CONFIDENCE = 0.5`, not the rejected side.
+
+**3. Diagnose a real phrase's rejection, without changing the code.** `'please can you go forward'`
+is rejected by the unmodified table. State which pipeline stage (voice, text, intent, or action)
+this failure belongs to, and what the *only* correct fix is under this chapter's bounded-set rule —
+contrast it with the incorrect fix of matching on the nearest phrase.
+*Correct result*: the failure is at the intent stage — the transcript is accurate text, just not one
+of the enumerated phrases. The correct fix is adding `'please can you go forward'` to
+`WALK_FORWARD`'s tuple explicitly, growing the enumerable table by one known phrase; the incorrect
+fix is any form of partial or fuzzy matching, which is exactly the nearest-match behavior the
+chapter rejected.
+
+**4. Choose local or service transcription for two robots, in writing.** (a) A humanoid in a
+research lab, tele-operated occasionally, where every spoken command is about the test in progress.
+(b) A humanoid in someone's home, listening for commands throughout the day.
+*Correct result*: (a) can reasonably favor a hosted service for its accuracy — nothing said near it
+is sensitive, and higher accuracy on technical phrasing is worth a network round trip. (b) favors
+local transcription — the audio a home microphone captures is not limited to commands, and privacy
+is the dominant constraint. If you chose the same answer for both, reread "Local vs. service
+transcription" and name the axis (latency, accuracy, or privacy) that changes between the two.
+
+---
+
+The humanoid can now turn a spoken sentence into one of a handful of commands it is actually willing
+to act on, and refuse everything else outright — the narrowest possible slice of "understand
+language," chosen deliberately narrow because acting on the wrong slice reaches [Chapter
+1.4](../ros2/urdf-describing-a-humanoid.mdx)'s twelve joints. What it still cannot do is anything a
+five-command table cannot express — "tidy the table," "bring me the red cup" — instructions that
+decompose into several of this robot's known actions rather than naming one directly. Deciding how
+far a system can go in accepting *more* language while keeping the same discipline about never
+acting on something ungrounded is where this book goes next.

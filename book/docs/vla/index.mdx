@@ -1,0 +1,74 @@
+---
+sidebar_position: 1
+title: "Module 4 — Vision-Language-Action (VLA)"
+---
+
+# Module 4 — Vision-Language-Action (VLA)
+
+[Module 3](../isaac/index.mdx) ends with a robot that can answer "where am I" and turn a goal pose
+into a path it walks toward. Every capability up to that point still needs someone to hand it the
+goal in the first place — a set of numbers typed into a Python call, an `(x, y, yaw)` a person
+worked out by hand. Nothing so far has let a person just say what they want.
+
+This module adds that missing input: a spoken instruction, in ordinary language, as the thing that
+starts everything else moving. **[4.1 Voice-to-Action with Whisper](./voice-to-action-whisper.mdx)**
+turns speech into a transcript and the transcript into one command from a small, fixed set — the
+first and narrowest slice of "understand what the human said." **4.2 Cognitive Planning with LLMs**
+widens that slice: an instruction too complex for one fixed command, decomposed by a language model
+into a sequence of primitives the robot actually has, and validated before any of them reach an
+actuator. **4.3 Capstone: The Autonomous Humanoid** introduces no new idea at all — it wires
+instruction, transcription, planning, navigation, and perception into one system, spoken words in,
+the simulated humanoid acting it out.
+
+*Module outcome*: the reader can connect spoken human instructions to validated robot action, and
+can assemble the whole book into one working system.
+
+*Prerequisites*: Modules 1–3.
+
+## The robot does not change here either
+
+Every chapter in this module still commands the humanoid from
+[Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx) — the same thirteen links, the same twelve
+revolute joints. Nothing about adding language changes the body; it changes what decides where that
+body goes next.
+
+## Hardware, and it runs the other way this time
+
+[Module 3](../isaac/index.mdx) opened with a hardware requirement stated before anything else: no
+NVIDIA RTX GPU, no Isaac Sim, no Isaac ROS. This module's opening hardware story is close to the
+opposite. Whisper's smaller models (`tiny`, `base`, `small`) run real-time transcription on an
+ordinary CPU — [Chapter 4.1](./voice-to-action-whisper.mdx) says exactly how the model sizes trade
+accuracy for speed, and none of them needs a GPU to be usable. What this module needs instead is a
+**microphone**, or failing that, a recorded audio file: Whisper transcribes either one identically,
+because from the model's point of view both are just a waveform.
+
+A reader with no microphone at all is not stuck. Every example in this module can run against a
+short prerecorded `.wav` file instead of a live recording — the transcription call takes a file path
+either way — so the chapter is written to make that path the normal one, not a fallback apologized
+for.
+
+## Software baseline
+
+| Component | Version |
+|---|---|
+| ROS 2 | Jazzy Jalisco |
+| Operating system | Ubuntu 24.04 LTS (Noble Numbat) |
+| Python | 3.12 |
+| Speech recognition | OpenAI Whisper |
+
+As with every module in this book, a chapter states again, at its own opening, exactly what it
+needs — this table is the summary, not the only place it is said.
+
+## What you need first
+
+**Background.** All of [Module 1](../ros2/index.mdx) through [Module 3](../isaac/index.mdx). This
+module assumes you can write an `rclpy` node that both subscribes and publishes, and that you know
+what the humanoid's body looks like — both established earlier and not repeated here. It does not
+require the GPU-bound parts of Module 3 to have actually been run; the perception and navigation
+*concepts* those chapters taught are what this module builds on, not a live Isaac stack.
+
+## Where this module ends
+
+This module — and the book — end in a capstone: one system, built entirely from pieces this book
+already taught, that takes a spoken sentence and turns it into the simulated humanoid doing
+something about it. Nothing in that capstone is new; every piece cites the chapter that taught it.
