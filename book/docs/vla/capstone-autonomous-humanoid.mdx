@@ -1,0 +1,859 @@
+---
+sidebar_position: 4
+title: "Capstone: The Autonomous Humanoid"
+---
+
+# Capstone: The Autonomous Humanoid
+
+Every chapter before this one built a piece and stopped at its own edge.
+[Chapter 4.1](./voice-to-action-whisper.mdx) stopped at publishing a command and said wiring it to
+an actuator was somebody else's paragraph. [Chapter 4.2](./cognitive-planning-llms.mdx) stopped at
+publishing a validated plan step and named the downstream node it would need as "the action-client
+pattern Chapter 3.3 already built, aimed at a new source."
+[Chapter 3.3](../isaac/nav2-path-planning.mdx) took its goal as three floats typed on a command line
+by a person. Each of those edges was the right place for that chapter to stop. Together they leave a
+system that exists entirely in pieces, with nobody having ever run a sentence all the way through.
+
+This chapter runs it all the way through, and it **introduces nothing new** — no new library, no new
+message type, no new concept. Everything here is composition, and the two source files below import
+their logic from the chapters that built it rather than restating it. What is new is the thing you
+only get from assembly: a view of where each layer's boundary actually is, what crosses it, and —
+when something goes wrong five layers deep — how to work out which layer to go fix.
+
+**Environment.** **ROS 2 Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**, **Python 3.12**. Example 1
+needs nothing else at all — standard library only. Example 2 and the full run need the stack the
+earlier chapters stood up: a Nav2 stack with a map and localization active
+([Chapter 3.3](../isaac/nav2-path-planning.mdx)), `openai-whisper` and `ffmpeg`
+([Chapter 4.1](./voice-to-action-whisper.mdx)), and the `anthropic` package with an
+`ANTHROPIC_API_KEY` in the environment ([Chapter 4.2](./cognitive-planning-llms.mdx)).
+
+## Learning objectives
+
+By the end of this chapter you will be able to:
+
+- Name every layer of the assembled system, say which chapter built it, and say what crosses each
+  boundary between them.
+- Run the complete system in simulation, from a spoken instruction to the humanoid moving.
+- Trace a single instruction through every layer and read off where it was accepted, escalated, or
+  refused.
+- Diagnose which layer a given failure belongs to, and distinguish the layer that *detected* a
+  failure from the layer *responsible* for it.
+- State what this system cannot do, and what it would additionally require before running on real
+  hardware.
+
+## The architecture, layer by layer
+
+Six things happen between a person speaking and the humanoid moving. Each is a component an earlier
+chapter built in isolation.
+
+| Layer | Built in | Takes | Produces |
+|---|---|---|---|
+| **ASR** | [4.1](./voice-to-action-whisper.mdx) | a waveform | a transcript + a confidence proxy |
+| **Intent** | [4.1](./voice-to-action-whisper.mdx) | a transcript | one bounded command, or a refusal |
+| **Planner** | [4.2](./cognitive-planning-llms.mdx) | an instruction | a proposed plan of named skills |
+| **Validator** | [4.2](./cognitive-planning-llms.mdx) | a proposed plan | an accepted plan, or a rejection |
+| **Executor** | [3.3](../isaac/nav2-path-planning.mdx) + here | one validated step | a `NavigateToPose` goal, or a publish |
+| **Perception** | [3.2](../isaac/isaac-ros-visual-slam.mdx), [2.3](../digital-twin/simulating-sensors.mdx) | camera and sensor streams | the pose Nav2 plans against |
+
+Perception is listed last but is not a final stage — it is the one layer that does not sit *in* the
+chain at all. It runs continuously alongside it, and everything above the executor is unaware of it.
+Nav2 cannot plan a path without knowing where the robot currently is, and that pose comes from
+[Chapter 3.2](../isaac/isaac-ros-visual-slam.mdx)'s visual SLAM node publishing on
+`visual_slam/tracking/odometry`, fed by the simulated camera
+[Chapter 2.3](../digital-twin/simulating-sensors.mdx) added to the robot. A planner asking for
+`walk_to(2.0, 1.0)` never mentions perception; it is simply assuming, correctly, that some layer
+below it knows what `(2.0, 1.0)` means relative to where the robot is standing right now. That
+assumption is worth making explicit, because when it stops holding — SLAM drifts, or loses tracking
+against a featureless wall — the symptom appears at the *executor*, as a navigation goal that fails
+or arrives somewhere wrong, several layers away from the actual cause.
+
+Underneath all of it is the same robot and the same simulator the book has used throughout:
+[Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx)'s `simple_humanoid.urdf`, spawned into a
+Gazebo Harmonic world by [Chapter 2.1](../digital-twin/gazebo-setup-and-basics.mdx), standing up
+under the physics [Chapter 2.2](../digital-twin/physics-gravity-collisions.mdx) configured. And
+between the layers, connecting them, is nothing more exotic than
+[Chapter 1.2](../ros2/ros2-architecture.mdx)'s topics and
+[Chapter 3.3](../isaac/nav2-path-planning.mdx)'s one action. That is the payoff of the architecture
+[Chapter 1.1](../ros2/physical-ai-embodied-intelligence.mdx) argued for at the very start: six
+components written weeks apart, by different reasoning, compose because each one only ever agreed to
+a message type.
+
+## Two paths through the same stack
+
+The table above suggests one straight line from ASR to executor. There are actually two paths, and
+which one an instruction takes is decided at the intent layer.
+
+"Stop" is a direct command. [Chapter 4.1](./voice-to-action-whisper.mdx)'s bounded table matches it
+exactly, and there is nothing for a planner to decompose — the whole point of that table is that
+`STOP` needs no reasoning between hearing it and doing it. It goes straight to the executor, and the
+planner and validator are skipped entirely. That is not a shortcut; it is the fast, cheap, fully
+enumerable path, and an emergency stop that had to wait for a language model round trip would be a
+worse system, not a more elegant one.
+
+"Walk to the kitchen" is not in that table, and this is where the two chapters join. Chapter 4.1
+rejected such a phrase with `out_of_vocabulary` and said so plainly: real phrasing a smarter system
+could have handled is turned away here, on purpose. The capstone is that smarter system, and an
+`out_of_vocabulary` rejection is exactly its trigger — the intent layer's way of saying *this was
+clear speech that names no direct command*, which is precisely the case
+[Chapter 4.2](./cognitive-planning-llms.mdx)'s planner exists to handle.
+
+The distinction that matters is which rejections escalate. Chapter 4.1's intent layer produces three
+kinds:
+
+- `out_of_vocabulary` — a trustworthy transcript naming no known command. **Escalates to the
+  planner.**
+- `low_confidence` — the model was not sure enough about what it heard. **Does not escalate.**
+- `empty_transcript` — there were no words. **Does not escalate.**
+
+Sending a low-confidence transcript to a planner would be the nearest-match mistake all over again,
+one layer up. The planner is good at turning a clear instruction into steps; it has no way to
+recover the words that were actually spoken, and asking it to plan from a phrase the ASR itself
+distrusts just launders an unreliable input into a confident-looking plan. Escalation is for
+*understood but unsupported*, never for *not reliably heard*.
+
+## The registry shrinks to fit the robot
+
+[Chapter 4.2](./cognitive-planning-llms.mdx) validated plans against a four-skill registry:
+`walk_to`, `pick_up`, `place_on`, `say`. Assembling the real system exposes something that chapter's
+illustrative registry could afford to leave alone: **this robot has no hand.**
+
+Look back at [Chapter 1.4](../ros2/urdf-describing-a-humanoid.mdx)'s model. Its thirteen links
+include `l_lower_arm` and `r_lower_arm`, and those are where the arms end — there is no gripper
+link, no finger joint, nothing that closes on an object. `pick_up(object_id="red_cup")` is a
+perfectly well-formed step naming a skill this book never gave the humanoid a body for. It is, in
+exactly Chapter 4.2's sense, **ungrounded** — and being unbothered by that would be the single
+loudest way to fail this book's own argument.
+
+So the capstone's registry has two skills, not four:
+
+- `walk_to(x, y)` — grounded in [Chapter 3.3](../isaac/nav2-path-planning.mdx)'s `NavigateToPose`
+  action, which really does exist and really does move the robot.
+- `say(text)` — grounded in a topic publish, the primitive
+  [Chapter 1.3](../ros2/python-agents-rclpy.mdx) built.
+
+This is not a downgrade from Chapter 4.2; it is that chapter's central claim applied without an
+exemption. A skill registry is a description of a particular robot's actual capabilities, not a
+wish list, and the consequence is worth watching for in the output below: "tidy the table" now fails
+— correctly, before anything moves — because the plan it produces names a skill this humanoid's body
+cannot perform.
+
+## Where the trust boundaries are
+
+The plan crosses two boundaries after it is validated, and each deserves its own check.
+
+The first is the one [Chapter 4.2](./cognitive-planning-llms.mdx) built: between the language
+model's output and the validator. Nothing about that has changed.
+
+The second is new to assembly and easy to miss. The planner publishes accepted steps on a topic, and
+the executor subscribes to it. A topic is not a function call — as
+[Chapter 1.2](../ros2/ros2-architecture.mdx) established, publishers and subscribers do not know
+each other, and any process on the network may publish on `/robot_plan_step`. The executor therefore
+cannot inherit the planner's validation by assumption; it can only inherit it by **re-running it**.
+The executor below re-validates every arriving step against the same registry before executing it,
+and the cost of that is a dictionary lookup against a table of two entries. The alternative — trusting
+that whatever arrived on the topic was validated by somebody — is trusting a claim nothing on the
+wire actually carries.
+
+## Tracing a failure to the layer that caused it
+
+Six layers deep, "it didn't work" is not a diagnosis. The useful discipline is to separate two
+questions that a single error message usually blurs together:
+
+**Which layer detected the failure?** Wherever the error surfaced.
+
+**Which layer is responsible for it?** Whichever layer produced the bad output that was detected.
+
+These are frequently not the same layer, and that gap is the whole reason a trace is worth having.
+When the validator rejects a plan containing `pick_up`, the validator is not what failed — it worked
+exactly as designed. The **planner** produced an ungrounded plan, and the planner's prompt or its
+registry description is what needs attention. When the intent layer rejects a transcript for low
+confidence, the intent layer is not what failed either; the **ASR** layer, or the audio it was
+given, is. Going to fix the layer that printed the error is the most common way to spend an
+afternoon on the wrong file.
+
+The rule this chapter's code follows, and which you can apply by hand to any failure the system
+produces:
+
+| Failure surfaces at | Reason | Responsible layer |
+|---|---|---|
+| Intent | `low_confidence`, `empty_transcript` | ASR — bad audio or a poor transcription |
+| Planner | no plan returned | Planner — the model call itself failed |
+| Validator | `ungrounded_skill`, `bad_arguments`, `argument_out_of_range`, `plan_too_long` | Planner — it composed the plan |
+| Validator | `malformed_json` | Planner — its output never parsed |
+| Executor | goal rejected, aborted, or cancelled | Executor — navigation, or the perception feeding it |
+
+The last row is the one that hides the most. A navigation goal that aborts may be a genuine
+executor-layer problem — no valid path, an obstacle in the costmap — or it may be perception:
+[Chapter 3.2](../isaac/isaac-ros-visual-slam.mdx)'s SLAM node drifting or losing tracking, so that
+the pose Nav2 is planning from no longer matches where the robot actually is. Both surface
+identically at the executor. Distinguishing them means looking at the pose stream directly, which is
+exactly what that chapter's subscriber node was for.
+
+There is also a distinction Chapter 4.2 drew that assembly makes concrete. A failure caught *before*
+dispatch cost nothing: nothing moved, and the system is in the same state it started in. A failure
+*during* execution has already spent some of its consequences — the robot walked somewhere, and the
+remaining steps were composed for a world where the failed step succeeded. The executor below drops
+the rest of the plan when a step fails rather than continuing into a world its plan no longer
+describes.
+
+## Code example
+
+### Environment
+
+**ROS 2 Jazzy Jalisco** on **Ubuntu 24.04 (Noble)**, **Python 3.12**. Both files below import from
+the earlier chapters' files, so put all four in one directory:
+
+| File | From |
+|---|---|
+| `voice_intent.py` | [Chapter 4.1](./voice-to-action-whisper.mdx) |
+| `plan_validator.py` | [Chapter 4.2](./cognitive-planning-llms.mdx) |
+| `mission_trace.py` | this chapter, Example 1 |
+| `skill_executor_node.py` | this chapter, Example 2 |
+
+That layout is the point, not an inconvenience: the capstone genuinely is the earlier chapters'
+code, imported and composed.
+
+### Example 1: the whole decision path, end to end, in plain Python
+
+This is every layer that decides *whether the robot moves*, assembled and traced. The two stages
+that need a model or a network — Whisper's transcription, and the call to Claude — are parameters
+here rather than live calls, which buys two things. It runs with no API key, no `ffmpeg`, and no ROS
+2 install. And it lets you reproduce a failure at any layer on demand instead of waiting for one to
+happen.
+
+**Status: executed and passing**, on Python 3.12.10 (`py -3.12`), standard library only, with
+Chapter 4.1's `voice_intent.py` and Chapter 4.2's `plan_validator.py` unmodified beside it.
+
+```python title="mission_trace.py"
+"""Pure Python, no ROS 2, no ML dependencies, no network.
+
+The whole book's decision path in one place: a transcript enters, and either
+a dispatch list comes out or the mission fails at a named layer. Every stage
+is imported from the chapter that built it -- nothing here is a reimplementation.
+
+  ASR        Chapter 4.1  audio -> transcript + confidence (its output is the
+                          input to this harness; Whisper itself needs a model)
+  INTENT     Chapter 4.1  voice_intent.map_transcript_to_command
+  PLANNER    Chapter 4.2  the LLM call (its output is an input here, so this
+                          harness runs with no API key and no network)
+  VALIDATOR  Chapter 4.2  plan_validator.validate_plan, against the registry
+                          below rather than 4.2's illustrative one
+  EXECUTOR   Chapter 3.3  Nav2 action client / topic publish (its per-step
+                          outcomes are inputs here)
+
+Run it to see one instruction traced through every layer, and to see each
+failure mode attributed to the layer that caused it.
+"""
+
+import json
+
+from voice_intent import map_transcript_to_command      # Chapter 4.1
+from plan_validator import validate_plan                # Chapter 4.2
+
+# The skill registry for *this* robot, not the illustrative one Chapter 4.2
+# used to teach validation. simple_humanoid.urdf (Chapter 1.4) has no hand:
+# its arms end at l_lower_arm and r_lower_arm. pick_up and place_on are
+# therefore not grounded in anything this book built, so they are not here.
+EMBODIED_SKILL_REGISTRY = {
+    'walk_to': {
+        'x': {'type': 'float', 'min': -5.0, 'max': 5.0},
+        'y': {'type': 'float', 'min': -5.0, 'max': 5.0},
+    },
+    'say': {
+        'text': {'type': 'str'},
+    },
+}
+
+
+class MissionTrace:
+    """One instruction's journey through the layers, and where it stopped."""
+
+    def __init__(self, transcript, confidence):
+        self.transcript = transcript
+        self.confidence = confidence
+        self.entries = []           # (layer, status, detail)
+        self.dispatch = []          # (topic, payload) actually handed downstream
+        self.succeeded = False
+        self.detected_at = None     # layer that noticed the failure
+        self.responsible = None     # layer whose output caused it
+
+    def record(self, layer, status, detail):
+        self.entries.append((layer, status, detail))
+
+    def fail(self, detected_at, responsible, detail):
+        self.record(detected_at, 'FAILED', detail)
+        self.detected_at = detected_at
+        self.responsible = responsible
+        return self
+
+    def succeed(self):
+        self.succeeded = True
+        return self
+
+    def report(self):
+        lines = ['=== %r (confidence %.2f) ===' % (self.transcript, self.confidence)]
+        for layer, status, detail in self.entries:
+            lines.append('  %-10s %-8s %s' % (layer, status, detail))
+        if self.succeeded:
+            lines.append('  %-10s %s' % ('RESULT', 'completed'))
+        else:
+            lines.append(
+                '  %-10s failed | detected at %s | responsible layer %s'
+                % ('RESULT', self.detected_at, self.responsible))
+        return '\n'.join(lines)
+
+
+def run_mission(transcript, confidence, planner_output=None, executor_outcomes=None):
+    """Trace one instruction from transcript to dispatch.
+
+    `planner_output` is the JSON string Chapter 4.2's planning call would have
+    returned, and `executor_outcomes` is the list of per-step results the
+    downstream executor would have reported ('succeeded', or a failure
+    reason). Both are parameters rather than live calls so that the whole
+    decision path -- the part that decides whether the robot moves -- runs
+    with nothing but the standard library, and so that a failure at any layer
+    can be reproduced on demand instead of waited for.
+    """
+    trace = MissionTrace(transcript, confidence)
+    trace.record('ASR', 'ok', 'transcript=%r confidence=%.2f' % (transcript, confidence))
+
+    # --- INTENT: Chapter 4.1's bounded table, unchanged --------------------
+    intent = map_transcript_to_command(transcript, confidence)
+
+    if intent.accepted:
+        trace.record('INTENT', 'ok', 'direct command %s (%s)' % (intent.command, intent.reason))
+        trace.record('PLANNER', 'skipped', 'not needed: the transcript is a direct command')
+        trace.record('VALIDATOR', 'skipped', 'not needed: no plan to validate')
+        trace.dispatch = [('voice_command', intent.command)]
+    elif intent.reason.startswith('out_of_vocabulary'):
+        # Not a failure. A trustworthy transcript that names no direct
+        # command is exactly what Chapter 4.2's planner exists for.
+        trace.record('INTENT', 'ok', 'no direct command; escalating to the planner')
+
+        # --- PLANNER: Chapter 4.2's LLM call ------------------------------
+        if planner_output is None:
+            return trace.fail('PLANNER', 'PLANNER', 'planner_unavailable: no plan produced')
+        trace.record('PLANNER', 'ok', 'proposed %s' % planner_output)
+
+        # --- VALIDATOR: Chapter 4.2's validator, this robot's registry ----
+        outcome = validate_plan(planner_output, registry=EMBODIED_SKILL_REGISTRY)
+        if not outcome.accepted:
+            # The validator did its job; the plan it rejected came from the
+            # planner, so that is the layer to go fix.
+            return trace.fail('VALIDATOR', 'PLANNER', outcome.reason)
+        trace.record('VALIDATOR', 'ok', outcome.reason)
+        trace.dispatch = [('robot_plan_step', json.dumps(step)) for step in outcome.plan]
+    else:
+        # low_confidence or empty_transcript: the intent stage noticed it,
+        # but nothing downstream could have fixed it -- the audio or the
+        # acoustic model is what failed.
+        return trace.fail('INTENT', 'ASR', intent.reason)
+
+    # --- EXECUTOR: Chapter 3.3's action client / a topic publish ----------
+    if executor_outcomes is None:
+        executor_outcomes = ['succeeded'] * len(trace.dispatch)
+
+    for index, (topic, payload) in enumerate(trace.dispatch):
+        result = executor_outcomes[index] if index < len(executor_outcomes) else 'succeeded'
+        if result != 'succeeded':
+            return trace.fail(
+                'EXECUTOR', 'EXECUTOR',
+                'step %d (%s <- %s) %s' % (index, topic, payload, result))
+        trace.record('EXECUTOR', 'ok', '%s <- %s [succeeded]' % (topic, payload))
+
+    return trace.succeed()
+
+
+if __name__ == '__main__':
+    walk_plan = ('[{"skill": "say", "args": {"text": "on my way"}},'
+                 ' {"skill": "walk_to", "args": {"x": 2.0, "y": 1.0}}]')
+    tidy_plan = ('[{"skill": "walk_to", "args": {"x": 1.0, "y": 2.0}},'
+                 ' {"skill": "pick_up", "args": {"object_id": "red_cup"}}]')
+
+    scenarios = [
+        # A direct command: Chapter 4.1's table handles it alone.
+        ('stop', 0.95, None, None),
+        # Too complex for the table, planned and executed end to end.
+        ('walk to the kitchen', 0.92, walk_plan, None),
+        # The same words, badly heard: rejected before any planning happens.
+        ('walk to the kitchen', 0.31, walk_plan, None),
+        # A plan naming a skill this robot's body does not have.
+        ('tidy the table', 0.90, tidy_plan, None),
+        # A well-formed plan whose navigation goal fails while running.
+        ('walk to the kitchen', 0.92, walk_plan, ['succeeded', 'aborted: no valid path to goal']),
+        # A planner that returned something that never parsed.
+        ('walk to the kitchen', 0.92, '[{"skill": "walk_to", "args": {"x": 2.0,', None),
+    ]
+
+    for transcript, confidence, planner_output, executor_outcomes in scenarios:
+        print(run_mission(transcript, confidence, planner_output, executor_outcomes).report())
+        print()
+```
+
+Run with `py -3.12 mission_trace.py`, this printed, exactly, on the authoring machine:
+
+```text
+=== 'stop' (confidence 0.95) ===
+  ASR        ok       transcript='stop' confidence=0.95
+  INTENT     ok       direct command STOP (matched 'stop')
+  PLANNER    skipped  not needed: the transcript is a direct command
+  VALIDATOR  skipped  not needed: no plan to validate
+  EXECUTOR   ok       voice_command <- STOP [succeeded]
+  RESULT     completed
+
+=== 'walk to the kitchen' (confidence 0.92) ===
+  ASR        ok       transcript='walk to the kitchen' confidence=0.92
+  INTENT     ok       no direct command; escalating to the planner
+  PLANNER    ok       proposed [{"skill": "say", "args": {"text": "on my way"}}, {"skill": "walk_to", "args": {"x": 2.0, "y": 1.0}}]
+  VALIDATOR  ok       ok: 2 step(s) validated
+  EXECUTOR   ok       robot_plan_step <- {"skill": "say", "args": {"text": "on my way"}} [succeeded]
+  EXECUTOR   ok       robot_plan_step <- {"skill": "walk_to", "args": {"x": 2.0, "y": 1.0}} [succeeded]
+  RESULT     completed
+
+=== 'walk to the kitchen' (confidence 0.31) ===
+  ASR        ok       transcript='walk to the kitchen' confidence=0.31
+  INTENT     FAILED   low_confidence: 0.31 < 0.50
+  RESULT     failed | detected at INTENT | responsible layer ASR
+
+=== 'tidy the table' (confidence 0.90) ===
+  ASR        ok       transcript='tidy the table' confidence=0.90
+  INTENT     ok       no direct command; escalating to the planner
+  PLANNER    ok       proposed [{"skill": "walk_to", "args": {"x": 1.0, "y": 2.0}}, {"skill": "pick_up", "args": {"object_id": "red_cup"}}]
+  VALIDATOR  FAILED   ungrounded_skill at index 1: 'pick_up' is not in the robot's skill registry
+  RESULT     failed | detected at VALIDATOR | responsible layer PLANNER
+
+=== 'walk to the kitchen' (confidence 0.92) ===
+  ASR        ok       transcript='walk to the kitchen' confidence=0.92
+  INTENT     ok       no direct command; escalating to the planner
+  PLANNER    ok       proposed [{"skill": "say", "args": {"text": "on my way"}}, {"skill": "walk_to", "args": {"x": 2.0, "y": 1.0}}]
+  VALIDATOR  ok       ok: 2 step(s) validated
+  EXECUTOR   ok       robot_plan_step <- {"skill": "say", "args": {"text": "on my way"}} [succeeded]
+  EXECUTOR   FAILED   step 1 (robot_plan_step <- {"skill": "walk_to", "args": {"x": 2.0, "y": 1.0}}) aborted: no valid path to goal
+  RESULT     failed | detected at EXECUTOR | responsible layer EXECUTOR
+
+=== 'walk to the kitchen' (confidence 0.92) ===
+  ASR        ok       transcript='walk to the kitchen' confidence=0.92
+  INTENT     ok       no direct command; escalating to the planner
+  PLANNER    ok       proposed [{"skill": "walk_to", "args": {"x": 2.0,
+  VALIDATOR  FAILED   malformed_json: Expecting property name enclosed in double quotes: line 1 column 41 (char 40)
+  RESULT     failed | detected at VALIDATOR | responsible layer PLANNER
+```
+
+Read those six traces against the two paths described above. The first takes the direct route —
+planner and validator skipped, one publish. The second escalates and runs to completion. The third
+is the same words at a confidence too low to trust, refused at the intent layer and attributed to
+the ASR layer that produced it. The fourth is the registry doing its job: `pick_up` is a reasonable
+English request that this robot has no hand for, caught before anything moved. The fifth is the only
+failure in the set that cost anything — the `say` step already ran, the walk aborted, and the trace
+records that the executor is where to look. The sixth shows a planner that returned unparseable
+output, detected at the validator and attributed, correctly, to the planner.
+
+### Example 2: the executor node, which is the piece that was actually missing
+
+[Chapter 4.2](./cognitive-planning-llms.mdx) published validated steps on `/robot_plan_step` and
+said what would consume them: "a downstream node translating `robot_plan_step` messages into
+`NavigateToPose` goals is exactly the action-client pattern Chapter 3.3 already built, aimed at a
+new source." This is that node. Its action-client half —
+`send_goal_async`, the feedback callback, the goal handle, the result future — is
+[Chapter 3.3](../isaac/nav2-path-planning.mdx)'s, with the goal coming from a subscription instead
+of `sys.argv`.
+
+The one design decision worth naming is the queue. Steps execute strictly one at a time: `walk_to`
+takes as long as the walk takes, and starting the next step before it finishes would mean acting in
+a world the plan has not reached yet. Since [Chapter 1.3](../ros2/python-agents-rclpy.mdx)'s rule
+still holds — a callback must return quickly, and may not block — the sequencing is done by having
+each step's completion callback start the next one, rather than by waiting anywhere.
+
+**Status: `blocked`. Environment required: a running ROS 2 Jazzy + Nav2 stack with a map and
+localization active.** The authoring machine is Windows with no ROS 2 install, so nothing that talks
+to a live `navigate_to_pose` server could be executed here. `python -m py_compile` confirms the file
+parses. Its action-client shape is the one already verified against the `navigation2` repository's
+`jazzy` branch in [Chapter 3.3](../isaac/nav2-path-planning.mdx), and the log output shown after it
+is traced by hand from this node's own logic, not observed.
+
+```python title="skill_executor_node.py"
+"""The last missing link: turns validated plan steps into robot motion.
+
+Subscribes to /robot_plan_step -- the topic Chapter 4.2's planner publishes
+on -- and executes each step in order, one at a time. walk_to becomes a
+NavigateToPose goal using Chapter 3.3's action-client pattern; say becomes a
+publish on /robot_speech. Every step is re-validated against this robot's own
+skill registry on arrival, because a topic is an open door: the executor
+trusts what it can check, not who sent it.
+
+Usage: python3 skill_executor_node.py
+
+Environment: ROS 2 Jazzy Jalisco, Ubuntu 24.04, Python 3.12, a running Nav2
+stack (the navigation2 release paired with Jazzy) with a map and localization
+active, plus example_interfaces, geometry_msgs, action_msgs and nav2_msgs --
+all shipped with a Jazzy install that includes Nav2.
+"""
+
+import collections
+import math
+
+from action_msgs.msg import GoalStatus
+from example_interfaces.msg import String
+from geometry_msgs.msg import PoseStamped
+from nav2_msgs.action import NavigateToPose
+
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.node import Node
+
+from mission_trace import EMBODIED_SKILL_REGISTRY    # Chapter 4.3, this chapter
+from plan_validator import validate_plan             # Chapter 4.2
+
+
+def yaw_to_quaternion(yaw):
+    """A 2D heading in radians, as the z/w quaternion PoseStamped expects.
+
+    Chapter 3.3's helper, unchanged.
+    """
+    return {'z': math.sin(yaw / 2.0), 'w': math.cos(yaw / 2.0)}
+
+
+class SkillExecutorNode(Node):
+
+    def __init__(self):
+        super().__init__('skill_executor_node')
+        self._queue = collections.deque()
+        self._busy = False
+        self._goal_handle = None
+
+        self._nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self._speech_pub = self.create_publisher(String, 'robot_speech', 10)
+        self.create_subscription(String, 'robot_plan_step', self.on_plan_step, 10)
+
+    # --- arrival ---------------------------------------------------------
+
+    def on_plan_step(self, msg):
+        """One validated step arrives from the planner. Re-check it, queue it."""
+        outcome = validate_plan('[%s]' % msg.data, registry=EMBODIED_SKILL_REGISTRY)
+        if not outcome.accepted:
+            self.get_logger().warning(
+                'rejected an incoming step at the executor boundary: %s' % outcome.reason)
+            return
+
+        step = outcome.plan[0]
+        self._queue.append(step)
+        self.get_logger().info(
+            'queued %s (%d step(s) waiting)' % (step['skill'], len(self._queue)))
+        self.start_next_if_idle()
+
+    # --- sequencing ------------------------------------------------------
+
+    def start_next_if_idle(self):
+        """Run the next queued step, unless one is already running.
+
+        Steps execute strictly in order: walk_to takes as long as the walk
+        takes, and starting the following step before it finishes would mean
+        acting on a world the plan has not reached yet.
+        """
+        if self._busy or not self._queue:
+            return
+
+        step = self._queue.popleft()
+        self._busy = True
+
+        if step['skill'] == 'walk_to':
+            self.execute_walk_to(step['args'])
+        elif step['skill'] == 'say':
+            self.execute_say(step['args'])
+        else:
+            # Unreachable while the registry and this branch agree. It is
+            # here so that adding a skill to the registry and forgetting to
+            # add it here fails loudly instead of hanging with _busy stuck.
+            self.abandon_plan('no executor implemented for skill %r' % step['skill'])
+
+    def wait_for_nav_server(self):
+        """Blocking, so it is called from main() and never from a callback."""
+        self.get_logger().info('waiting for the navigate_to_pose action server...')
+        self._nav_client.wait_for_server()
+
+    def finish_step(self, detail):
+        self.get_logger().info('step finished: %s' % detail)
+        self._busy = False
+        self._goal_handle = None
+        self.start_next_if_idle()
+
+    # --- the two skills this robot actually has --------------------------
+
+    def execute_say(self, args):
+        msg = String()
+        msg.data = args['text']
+        self._speech_pub.publish(msg)
+        self.finish_step('say %r' % args['text'])
+
+    def execute_walk_to(self, args):
+        pose = PoseStamped()
+        pose.header.frame_id = 'map'
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = float(args['x'])
+        pose.pose.position.y = float(args['y'])
+        quaternion = yaw_to_quaternion(0.0)
+        pose.pose.orientation.z = quaternion['z']
+        pose.pose.orientation.w = quaternion['w']
+
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose = pose
+        goal_msg.behavior_tree = ''  # empty: bt_navigator falls back to its default tree
+
+        self.get_logger().info(
+            'walk_to x=%.2f y=%.2f -- sending a NavigateToPose goal'
+            % (pose.pose.position.x, pose.pose.position.y))
+
+        send_goal_future = self._nav_client.send_goal_async(
+            goal_msg, feedback_callback=self.on_nav_feedback)
+        send_goal_future.add_done_callback(self.on_nav_goal_response)
+
+    # --- Chapter 3.3's three futures, three callbacks --------------------
+
+    def on_nav_feedback(self, feedback_msg):
+        self.get_logger().info(
+            'navigating: %.2f m remaining'
+            % feedback_msg.feedback.distance_remaining)
+
+    def on_nav_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.abandon_plan('navigation goal rejected by the behavior tree navigator')
+            return
+
+        self._goal_handle = goal_handle
+        self.get_logger().info('navigation goal accepted')
+        goal_handle.get_result_async().add_done_callback(self.on_nav_result)
+
+    def on_nav_result(self, future):
+        status = future.result().status
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.finish_step('walk_to arrived')
+        elif status == GoalStatus.STATUS_CANCELED:
+            self.abandon_plan('navigation was cancelled')
+        else:
+            self.abandon_plan(
+                'navigation ended with status %d: %s'
+                % (status, future.result().result.error_msg))
+
+    # --- failure ---------------------------------------------------------
+
+    def abandon_plan(self, detail):
+        """A step failed while running. Drop the rest of the plan.
+
+        The remaining steps were composed for a world in which this step
+        succeeded. Chapter 4.2 named the alternative -- replanning from the
+        world as it now is -- and this executor deliberately does not
+        attempt it: stopping is the outcome a person can predict.
+        """
+        dropped = len(self._queue)
+        self._queue.clear()
+        self._busy = False
+        self._goal_handle = None
+        self.get_logger().error(
+            'EXECUTOR layer failed: %s -- dropping %d remaining step(s)' % (detail, dropped))
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SkillExecutorNode()
+    # Blocking, so it happens here rather than inside a callback: a callback
+    # that blocks is a callback rclpy cannot get its thread back from.
+    node.wait_for_nav_server()
+    node.get_logger().info('executor ready, waiting for /robot_plan_step')
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+```
+
+### Running the whole system
+
+Six long-running processes, one per layer, plus the one-off spawn
+[Chapter 2.1](../digital-twin/gazebo-setup-and-basics.mdx) introduced. Every command below is one an
+earlier chapter already ran, except terminal 5, which is this chapter's executor node. Each numbered
+block needs its own terminal, since every one of these processes blocks.
+
+```bash
+# 1 — the world (Chapters 2.1, 2.2)
+gz sim -v 4 empty.sdf
+
+# 1b — the robot, spawned into the running world from a spare terminal (Chapter 2.1)
+ros2 run ros_gz_sim create \
+  -world empty \
+  -file ~/humanoid/simple_humanoid.urdf \
+  -name simple_humanoid \
+  -z 0.9
+
+# 2 — the ROS 2 side of the simulator (Chapters 2.1, 2.3)
+ros2 run ros_gz_bridge parameter_bridge \
+  /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock \
+  /humanoid/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan \
+  /humanoid/depth@sensor_msgs/msg/Image[gz.msgs.Image \
+  /humanoid/imu@sensor_msgs/msg/Imu[gz.msgs.IMU
+
+# 3 — perception: pose estimation (Chapter 3.2; needs an NVIDIA RTX GPU)
+ros2 launch isaac_ros_visual_slam isaac_ros_visual_slam_isaac_sim.launch.py
+
+# 4 — navigation (Chapter 3.3)
+ros2 launch nav2_bringup navigation_launch.py
+
+# 5 — the executor (this chapter)
+source /opt/ros/jazzy/setup.bash
+python3 skill_executor_node.py
+
+# 6 — the instruction (Chapters 4.1, 4.2)
+source /opt/ros/jazzy/setup.bash
+export ANTHROPIC_API_KEY=...        # never hardcoded
+python3 cognitive_planner_node.py "walk to the kitchen"
+```
+
+One seam in that list is worth stating rather than glossing over. Terminal 3 is the launch file
+[Chapter 3.2](../isaac/isaac-ros-visual-slam.mdx) verified, and it is the **Isaac Sim** variant —
+that chapter ran visual SLAM against an Isaac Sim scene, not against Gazebo, and it needs an NVIDIA
+RTX GPU. A reader running the Gazebo world in terminal 1 therefore does not get pose estimation from
+terminal 3 as written; they need a localization source fed by the Gazebo sensor streams terminal 2
+is already bridging. Nav2 does not care which one it is —
+[Chapter 3.3](../isaac/nav2-path-planning.mdx) required "a localization source publishing the robot's
+pose in the `map` frame," and named Chapter 3.2's as one option among others. This is the honest
+shape of the assembled system: the perception layer has a clean interface and two different
+implementations behind it, and which one you run depends on hardware this book has been explicit
+about since [Module 3's landing page](../isaac/index.mdx).
+
+Terminal 6 is where a person actually speaks — swap `cognitive_planner_node.py` for
+[Chapter 4.1](./voice-to-action-whisper.mdx)'s `voice_command_node.py` to drive the direct-command
+path from a `.wav` file instead. Terminal 5 then logs the mission as it runs, and this is what its
+log would look like for the plan traced above, hand-traced from this node's own logic rather than
+observed:
+
+```text
+[INFO] [skill_executor_node]: waiting for the navigate_to_pose action server...
+[INFO] [skill_executor_node]: executor ready, waiting for /robot_plan_step
+[INFO] [skill_executor_node]: queued say (1 step(s) waiting)
+[INFO] [skill_executor_node]: step finished: say 'on my way'
+[INFO] [skill_executor_node]: queued walk_to (1 step(s) waiting)
+[INFO] [skill_executor_node]: walk_to x=2.00 y=1.00 -- sending a NavigateToPose goal
+[INFO] [skill_executor_node]: navigation goal accepted
+[INFO] [skill_executor_node]: navigating: 2.24 m remaining
+[INFO] [skill_executor_node]: navigating: 1.61 m remaining
+[INFO] [skill_executor_node]: navigating: 0.88 m remaining
+[INFO] [skill_executor_node]: step finished: walk_to arrived
+```
+
+A step that arrives on `/robot_plan_step` without having been validated — publish one by hand with
+`ros2 topic pub` and see — is refused at the executor's own boundary instead:
+
+```text
+[WARN] [skill_executor_node]: rejected an incoming step at the executor boundary: ungrounded_skill at index 0: 'pick_up' is not in the robot's skill registry
+```
+
+## What this system cannot do
+
+An honest capstone ends with its own limits, and this one has four that matter.
+
+**It does not walk.** This is the largest gap in the book, and
+[Chapter 3.3](../isaac/nav2-path-planning.mdx) named it precisely: Nav2 produces a 2D path for a
+robot whose footprint is fixed and whose stability does not depend on the sequence of its footfalls.
+A humanoid's does. Between the path this system plans and a humanoid actually crossing a room sits a
+**footstep planner** and a balance controller, neither of which this book built. What runs in
+simulation is a correct route, followed by a base that is not yet stepping.
+
+**It has no hands.** Already visible in the registry above, and worth restating as a limit rather
+than a detail: the set of instructions this system can carry out is exactly "go somewhere" and "say
+something."
+
+**It has no memory between instructions.** Each instruction starts from nothing. The system cannot
+resolve "go back where you were," because nothing retains where that was.
+
+**It does not close the loop on its own outcomes.** The executor reports failure and stops. It does
+not observe that a walk ended somewhere unexpected and reconsider — the replanning
+[Chapter 4.2](./cognitive-planning-llms.mdx) described exists as a design, not as running code here.
+
+### And before real hardware
+
+Three requirements that simulation never charges you for:
+
+**Real-time guarantees.** Everything above is written as though a callback taking an extra hundred
+milliseconds is a performance question. On a balancing biped it is a falling-over question. A real
+humanoid runs its balance controller on a hard real-time loop, entirely below and independent of
+this stack — a language model in the path of a balance controller is not a slow system, it is a
+system that falls.
+
+**A stop that does not depend on any of this.** The `STOP` command above travels through ASR,
+intent, a topic, and an executor. Every one of those can be slow or fail. A real robot needs a
+hardware emergency stop that cuts power to the actuators without consulting software, and the
+software `STOP` is a convenience layered on top of it, never a replacement.
+
+**Perception that survives the real world.** [Chapter 3.2](../isaac/isaac-ros-visual-slam.mdx)'s
+failure modes — featureless walls, motion blur, drift — are things you *read about* in simulation
+and things you *hit* outdoors, in changing light, with people moving through the scene. Every
+`walk_to` in this book assumes a pose estimate that is correct. Making that assumption hold on real
+hardware is its own engineering programme.
+
+None of these makes the system above a toy. It is a correct, layered architecture with its trust
+boundaries in the right places, and the parts that are missing are missing because this book chose
+its scope, not because the design has nowhere to put them.
+
+## Exercises
+
+**1. Add a third skill, end to end.** In `mission_trace.py`, add `'turn_to': {'yaw': {'type':
+'float', 'min': -3.15, 'max': 3.15}}` to `EMBODIED_SKILL_REGISTRY`. Then call `run_mission` with a
+planner output containing one `turn_to` step, and separately with one whose `yaw` is `10.0`.
+*Correct result*: the first completes; the second fails at the validator with
+`argument_out_of_range`, attributed to the planner. Then read `skill_executor_node.py`'s
+`start_next_if_idle` and say what would happen if you added the skill to the registry but not to
+that method — the `else` branch there tells you, and explains why it exists.
+
+**2. Attribute five failures by hand, without running anything.** For each of these, name the layer
+that would detect it and the layer responsible: (a) a `.wav` file of someone coughing; (b) a plan
+whose second step is `place_on`; (c) Nav2 not running when the executor starts; (d) a plan of eight
+`say` steps; (e) the robot walking confidently to a spot two metres from where it was asked to go.
+*Correct result*: (a) detected at intent, responsible ASR — `low_confidence` or `empty_transcript`.
+(b) detected at validator, responsible planner — `ungrounded_skill`. (c) detected at the executor,
+responsible executor — `wait_for_nav_server` blocks in `main` and the node never reaches `spin`, so
+nothing is ever consumed from the topic. (d) detected at validator, responsible planner —
+`plan_too_long`, since `MAX_PLAN_STEPS` is 6. (e) detected at the executor, responsible
+**perception** — navigation succeeded against a pose estimate that had drifted, which is the row of
+the diagnosis table that hides the most.
+
+**3. Show that the executor's re-validation is not redundant.** The executor re-checks every step
+that arrives on `/robot_plan_step`, even though the planner only publishes steps its own validator
+already accepted. Reproduce what that second check catches, without ROS 2: call
+`validate_plan('[%s]' % payload, registry=EMBODIED_SKILL_REGISTRY)` — the exact call
+`on_plan_step` makes — for `payload` equal to each of `'{"skill": "say", "args": {"text": "hello"}}'`,
+`'{"skill": "pick_up", "args": {"object_id": "cup"}}'`, and
+`'{"skill": "walk_to", "args": {"x": 99.0, "y": 0.0}}'`. Then name the property of ROS 2 topics from
+[Chapter 1.2](../ros2/ros2-architecture.mdx) that makes the check necessary rather than duplicated
+work.
+*Correct result*: the first is accepted; the second is rejected with `ungrounded_skill`; the third
+with `argument_out_of_range`. The property is anonymity — a subscriber does not know which publisher
+sent a message, and any process on the network may publish on `/robot_plan_step`. "It was validated
+upstream" is a claim about a sender the executor cannot identify, so the only validation it can rely
+on is validation it performs itself.
+
+**4. Defend the escalation rule in writing.** The intent layer escalates `out_of_vocabulary` to the
+planner but refuses to escalate `low_confidence`. Argue for two paragraphs why sending a
+low-confidence transcript to a language model would be worse than refusing it, in terms of the
+trust-boundary argument [Chapter 4.2](./cognitive-planning-llms.mdx) made.
+*Correct result*: your argument should reach the point that a planner cannot recover words the ASR
+never reliably heard, so planning from a distrusted transcript converts an acknowledged uncertainty
+into a confident, well-formed, fully validated plan — one that passes every downstream check while
+being an answer to a question nobody asked. The validator cannot catch this, because the plan is
+grounded and well-typed; it is just for the wrong instruction.
+
+---
+
+That is the book. Four modules: a nervous system that lets independently written processes talk
+([Module 1](../ros2/index.mdx)), a simulated world and a body to put in it
+([Module 2](../digital-twin/index.mdx)), perception and navigation that answer "where am I" and "how
+do I get there" ([Module 3](../isaac/index.mdx)), and language that lets a person state a goal
+without knowing any of it ([Module 4](./index.mdx)). The capstone added no fifth idea — it only
+showed that the four compose, which was the claim
+[Chapter 1.1](../ros2/physical-ai-embodied-intelligence.mdx) opened with and the only one that could
+not be demonstrated until now.
+
+What is left is the gap named honestly throughout: this humanoid plans a route it cannot yet walk,
+and reaches for objects it has no hands to hold. Those are the next things to build, and every one
+of them plugs into a boundary this architecture already has a place for.
