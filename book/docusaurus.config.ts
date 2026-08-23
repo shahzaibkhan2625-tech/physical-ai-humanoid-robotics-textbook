@@ -10,7 +10,7 @@ const projectName = 'physical-ai-humanoid-robotics-textbook';
 // Where the chat widget sends questions. Set CHAT_API_URL at build time to point
 // the published site at the deployed backend (the Hugging Face Space); the
 // default keeps `npm start` talking to a locally running service.
-const chatApiUrl = process.env.CHAT_API_URL ?? 'http://localhost:8000';
+const chatApiUrl = process.env.CHAT_API_URL ?? 'http://localhost:8001';
 
 const config: Config = {
   title: 'Physical AI & Humanoid Robotics',
