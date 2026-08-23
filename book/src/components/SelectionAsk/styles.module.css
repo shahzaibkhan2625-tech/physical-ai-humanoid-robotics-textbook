@@ -1,0 +1,32 @@
+/* The floating "Ask AI" button. Positioned inline from the selection rectangle;
+   the transform centres it on the selection and lifts it clear of the text. */
+
+.button {
+  position: fixed;
+  transform: translate(-50%, -100%);
+  z-index: 350;
+
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.3rem 0.6rem;
+  border: none;
+  border-radius: 999px;
+  background: var(--ifm-color-primary);
+  color: #fff;
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: 0 3px 10px rgb(0 0 0 / 28%);
+}
+
+.button:hover {
+  background: var(--ifm-color-primary-dark);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--ifm-color-primary-lightest);
+  outline-offset: 2px;
+}
