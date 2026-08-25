@@ -7,10 +7,16 @@ import type * as Preset from '@docusaurus/preset-classic';
 const organizationName = 'shahzaibkhan2625-tech';
 const projectName = 'physical-ai-humanoid-robotics-textbook';
 
-// Where the chat widget sends questions. Set CHAT_API_URL at build time to point
-// the published site at the deployed backend (the Hugging Face Space); the
-// default keeps `npm start` talking to a locally running service.
-const chatApiUrl = process.env.CHAT_API_URL ?? 'http://localhost:8001';
+// Where the chat widget sends questions. CHAT_API_URL always wins if set.
+// Otherwise: `docusaurus build` sets NODE_ENV=production, so production
+// builds (npm run build, including CI) default to the deployed backend (the
+// Hugging Face Space); `npm start` (NODE_ENV=development) keeps talking to
+// a locally running service.
+const chatApiUrl =
+  process.env.CHAT_API_URL ??
+  (process.env.NODE_ENV === 'production'
+    ? 'https://shahzaibkhan0505-physical-ai-chatbot.hf.space'
+    : 'http://localhost:8000');
 
 const config: Config = {
   title: 'Physical AI & Humanoid Robotics',

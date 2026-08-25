@@ -62,7 +62,9 @@ google-auth==2.56.3
 google-genai==2.17.0
     # via backend
 gradio==6.26.0
-    # via backend
+    # via
+    #   backend
+    #   spaces
 gradio-client==2.6.1
     # via
     #   gradio
@@ -97,6 +99,7 @@ httpx==0.28.1
     #   openai
     #   qdrant-client
     #   safehttpx
+    #   spaces
 httpx-sse==0.4.3
     # via mcp
 huggingface-hub==1.28.0
@@ -144,6 +147,7 @@ packaging==26.3
     #   gradio
     #   gradio-client
     #   huggingface-hub
+    #   spaces
 pandas==3.0.5
     # via gradio
 pillow==12.3.0
@@ -162,8 +166,9 @@ pyasn1-modules==0.4.2
     # via google-auth
 pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
     # via cffi
-pydantic==2.13.4
+pydantic==2.12.5
     # via
+    #   backend
     #   fastapi
     #   google-genai
     #   gradio
@@ -172,7 +177,8 @@ pydantic==2.13.4
     #   openai-agents
     #   pydantic-settings
     #   qdrant-client
-pydantic-core==2.46.4
+    #   spaces
+pydantic-core==2.41.5
     # via pydantic
 pydantic-settings==2.15.0
     # via mcp
@@ -213,6 +219,7 @@ requests==2.34.2
     #   google-auth
     #   google-genai
     #   openai-agents
+    #   spaces
 rich==15.0.0
     # via typer
 rpds-py==2026.6.3
@@ -231,6 +238,8 @@ sniffio==1.3.1
     # via
     #   google-genai
     #   openai
+spaces==0.51.1
+    # via backend
 sse-starlette==3.4.8
     # via mcp
 starlette==1.5.0
@@ -267,6 +276,7 @@ typing-extensions==4.16.0
     #   pydantic
     #   pydantic-core
     #   referencing
+    #   spaces
     #   starlette
     #   typing-inspection
 typing-inspection==0.4.2
