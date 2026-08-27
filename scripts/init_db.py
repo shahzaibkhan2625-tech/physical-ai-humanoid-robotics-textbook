@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS users (
 );
 """
 
+# Separate ALTER rather than folding into CREATE_USERS_TABLE_SQL, so a users
+# table created before this column existed still picks it up on a re-run.
+ADD_EXPERIENCE_LEVEL_COLUMN_SQL = """
+ALTER TABLE users ADD COLUMN IF NOT EXISTS experience_level TEXT DEFAULT 'beginner';
+"""
+
 
 def main() -> int:
     if not ENV_PATH.exists():
@@ -53,6 +59,7 @@ def main() -> int:
         with conn.cursor() as cur:
             cur.execute(CREATE_TABLE_SQL)
             cur.execute(CREATE_USERS_TABLE_SQL)
+            cur.execute(ADD_EXPERIENCE_LEVEL_COLUMN_SQL)
             conn.commit()
 
             ok = True

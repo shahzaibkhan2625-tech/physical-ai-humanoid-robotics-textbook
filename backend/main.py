@@ -47,7 +47,7 @@ from agents import (
     set_tracing_disabled,
 )
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
@@ -247,9 +247,15 @@ class HistoryResponse(BaseModel):
     turns: list[Turn]
 
 
+ExperienceLevel = Literal["beginner", "intermediate", "advanced"]
+
+
 class SignupRequest(BaseModel):
     email: str = Field(..., description="Email address to register.")
     password: str = Field(..., description="Plain-text password; never stored as-is.")
+    experience_level: ExperienceLevel = Field(
+        "beginner", description="Reader's self-reported robotics experience."
+    )
 
 
 class SignupResponse(BaseModel):
@@ -517,6 +523,7 @@ async def generate(
     passages: list[Source],
     selected: str | None,
     history: list[dict[str, str]],
+    agent: Agent,
 ) -> tuple[str, bool | None, list[int] | None]:
     """Run the agent over the retrieved context: (answer, answered, used)."""
     conversation: list[dict[str, str]] = [*history]
@@ -525,7 +532,7 @@ async def generate(
     )
 
     result = await asyncio.wait_for(
-        Runner.run(clients.agent, conversation), timeout=GENERATE_TIMEOUT_S
+        Runner.run(agent, conversation), timeout=GENERATE_TIMEOUT_S
     )
     return parse_verdict(str(result.final_output or "").strip(), len(passages))
 
@@ -700,12 +707,12 @@ def create_access_token(email: str) -> str:
     return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
 
 
-def _insert_user(email: str, password_hash: str) -> None:
+def _insert_user(email: str, password_hash: str, experience_level: str) -> None:
     with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO users (email, password_hash) VALUES (%s, %s);",
-                (email, password_hash),
+                "INSERT INTO users (email, password_hash, experience_level) VALUES (%s, %s, %s);",
+                (email, password_hash, experience_level),
             )
         conn.commit()
 
@@ -717,6 +724,71 @@ def _select_user(email: str) -> tuple[str, str] | None:
             (email,),
         )
         return cur.fetchone()
+
+
+def _select_experience_level(email: str) -> tuple[str] | None:
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT experience_level FROM users WHERE email = %s;",
+            (email,),
+        )
+        return cur.fetchone()
+
+
+def decode_access_token(token: str) -> str | None:
+    """The token's subject email, or None for a missing/invalid/expired token.
+
+    Deliberately swallows every JWT failure rather than raising: an absent or
+    bad token on /chat must fall back to unpersonalized behavior, not an error.
+    """
+    secret = getenv("JWT_SECRET_KEY")
+    if not secret:
+        return None
+    try:
+        payload = jwt.decode(token, secret, algorithms=[JWT_ALGORITHM])
+    except jwt.PyJWTError:
+        return None
+    return payload.get("sub")
+
+
+async def experience_level_for_request(authorization: str | None) -> str | None:
+    """The caller's saved experience_level, or None for logged-out/invalid auth."""
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    email = decode_access_token(token)
+    if not email or not clients.database_url:
+        return None
+    try:
+        row = await query(_select_experience_level, email)
+    except Exception as exc:  # noqa: BLE001 - personalization is best-effort
+        log.warning("experience_level lookup failed, answering unpersonalized: %r", exc)
+        return None
+    return row[0] if row else None
+
+
+PERSONALIZATION_HINTS: dict[str, str] = {
+    "beginner": (
+        "The reader is a beginner. Keep explanations simple, define technical "
+        "terms when you use them, and avoid assuming prior robotics experience."
+    ),
+    "intermediate": (
+        "The reader has intermediate experience. You can assume basic "
+        "familiarity with ROS 2 and robotics concepts without re-explaining them."
+    ),
+    "advanced": (
+        "The reader is advanced. Technical depth and precision are fine; do not "
+        "over-explain fundamentals."
+    ),
+}
+
+
+def agent_for(experience_level: str | None) -> Agent:
+    """The shared agent, or a clone with a personalization hint appended."""
+    hint = PERSONALIZATION_HINTS.get(experience_level or "")
+    if not hint:
+        return clients.agent
+    return clients.agent.clone(instructions=f"{SYSTEM_INSTRUCTIONS}\n\n{hint}")
 
 
 # --- endpoints -----------------------------------------------------------------
@@ -768,8 +840,11 @@ async def ready() -> dict[str, Any]:
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest) -> ChatResponse:
+async def chat(
+    request: ChatRequest, authorization: str | None = Header(None)
+) -> ChatResponse:
     started = time.monotonic()
+    experience_level = await experience_level_for_request(authorization)
 
     question = (request.question or "").strip()
     selected = (request.selected_text or "").strip() or None
@@ -842,7 +917,8 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
     # 4. Generate, then gate two: the model rules on whether the book answered.
     try:
-        answer, answered, used = await generate(question, passages, selected, history)
+        agent = agent_for(experience_level)
+        answer, answered, used = await generate(question, passages, selected, history, agent)
     except asyncio.TimeoutError:
         raise fail(504, "timeout", "The answer took too long. Please try again.")
     except Exception as exc:  # noqa: BLE001
@@ -1035,7 +1111,7 @@ async def signup(request: SignupRequest) -> SignupResponse:
     password_hash = hash_password(password)
 
     try:
-        await query(_insert_user, email, password_hash)
+        await query(_insert_user, email, password_hash, request.experience_level)
     except psycopg.errors.UniqueViolation:
         raise fail(409, "bad_request", "An account with that email already exists.")
     except Exception as exc:  # noqa: BLE001

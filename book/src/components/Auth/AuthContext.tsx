@@ -17,7 +17,12 @@ import React, {
 } from 'react';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 
-import {signup as signupRequest, login as loginRequest, AuthApiError} from './api';
+import {
+  signup as signupRequest,
+  login as loginRequest,
+  AuthApiError,
+  type ExperienceLevel,
+} from './api';
 
 type AuthContextValue = {
   token: string | null;
@@ -25,7 +30,7 @@ type AuthContextValue = {
   pending: boolean;
   error: string | null;
   login: (email: string, password: string) => Promise<void>;
-  signup: (email: string, password: string) => Promise<void>;
+  signup: (email: string, password: string, experienceLevel: ExperienceLevel) => Promise<void>;
   logout: () => void;
   clearError: () => void;
 };
@@ -79,11 +84,11 @@ export function AuthProvider({children}: {children: ReactNode}): ReactNode {
   );
 
   const signup = useCallback(
-    async (emailInput: string, password: string) => {
+    async (emailInput: string, password: string, experienceLevel: ExperienceLevel) => {
       setPending(true);
       setError(null);
       try {
-        await signupRequest(apiUrl, emailInput, password);
+        await signupRequest(apiUrl, emailInput, password, experienceLevel);
         // Signing up and then having to sign in again is friction the reader
         // does not need — go straight to a logged-in state.
         const result = await loginRequest(apiUrl, emailInput, password);

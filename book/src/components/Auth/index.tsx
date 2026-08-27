@@ -10,6 +10,7 @@
 import React, {useState} from 'react';
 
 import {useAuth} from './AuthContext';
+import type {ExperienceLevel} from './api';
 import styles from './styles.module.css';
 
 type Mode = 'login' | 'signup';
@@ -19,12 +20,13 @@ function AuthModal({onClose}: {onClose: () => void}): React.ReactElement {
   const [mode, setMode] = useState<Mode>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [experienceLevel, setExperienceLevel] = useState<ExperienceLevel>('beginner');
 
   async function submit(event: React.FormEvent): Promise<void> {
     event.preventDefault();
     try {
       if (mode === 'signup') {
-        await signup(email, password);
+        await signup(email, password, experienceLevel);
       } else {
         await login(email, password);
       }
@@ -77,6 +79,26 @@ function AuthModal({onClose}: {onClose: () => void}): React.ReactElement {
           value={password}
           onChange={(event) => setPassword(event.target.value)}
         />
+
+        {mode === 'signup' && (
+          <>
+            <label className={styles.label} htmlFor="auth-experience-level">
+              Experience level
+            </label>
+            <select
+              id="auth-experience-level"
+              className={styles.input}
+              value={experienceLevel}
+              onChange={(event) =>
+                setExperienceLevel(event.target.value as ExperienceLevel)
+              }
+            >
+              <option value="beginner">Beginner</option>
+              <option value="intermediate">Intermediate</option>
+              <option value="advanced">Advanced</option>
+            </select>
+          </>
+        )}
 
         {error && (
           <p className={styles.error} role="alert">

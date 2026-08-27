@@ -8,6 +8,8 @@
 
 const REQUEST_TIMEOUT_MS = 15_000;
 
+export type ExperienceLevel = 'beginner' | 'intermediate' | 'advanced';
+
 export type SignupResponse = {
   message: string;
 };
@@ -85,8 +87,13 @@ export function signup(
   baseUrl: string,
   email: string,
   password: string,
+  experienceLevel: ExperienceLevel,
 ): Promise<SignupResponse> {
-  return post<SignupResponse>(baseUrl, '/signup', {email, password});
+  return post<SignupResponse>(baseUrl, '/signup', {
+    email,
+    password,
+    experience_level: experienceLevel,
+  });
 }
 
 export function login(
