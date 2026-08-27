@@ -1,7 +1,7 @@
-"""Create the chat_history table in Neon Postgres.
+"""Create the chat_history and users tables in Neon Postgres.
 
 Reads NEON_DATABASE_URL from the repo-root .env, connects, and creates the
-table if it does not already exist. Safe to re-run.
+tables if they do not already exist. Safe to re-run.
 
 Usage (from the repo root):
     backend/.venv/Scripts/python.exe scripts/init_db.py
@@ -28,6 +28,15 @@ CREATE TABLE IF NOT EXISTS chat_history (
 );
 """
 
+CREATE_USERS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    id            SERIAL PRIMARY KEY,
+    email         TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+"""
+
 
 def main() -> int:
     if not ENV_PATH.exists():
@@ -43,28 +52,35 @@ def main() -> int:
     with psycopg.connect(database_url) as conn:
         with conn.cursor() as cur:
             cur.execute(CREATE_TABLE_SQL)
+            cur.execute(CREATE_USERS_TABLE_SQL)
             conn.commit()
 
-            cur.execute(
-                """
-                SELECT column_name, data_type, is_nullable, column_default
-                FROM information_schema.columns
-                WHERE table_name = 'chat_history'
-                ORDER BY ordinal_position;
-                """
-            )
-            columns = cur.fetchall()
+            ok = True
+            for table_name in ("chat_history", "users"):
+                cur.execute(
+                    """
+                    SELECT column_name, data_type, is_nullable, column_default
+                    FROM information_schema.columns
+                    WHERE table_name = %s
+                    ORDER BY ordinal_position;
+                    """,
+                    (table_name,),
+                )
+                columns = cur.fetchall()
 
-    if not columns:
-        print("ERROR: chat_history was not found after creation", file=sys.stderr)
-        return 1
+                if not columns:
+                    print(f"ERROR: {table_name} was not found after creation", file=sys.stderr)
+                    ok = False
+                    continue
 
-    print("chat_history table exists with columns:")
-    for name, data_type, nullable, default in columns:
-        null_note = "NULL" if nullable == "YES" else "NOT NULL"
-        default_note = f" DEFAULT {default}" if default else ""
-        print(f"  {name:<14} {data_type:<26} {null_note}{default_note}")
-    return 0
+                print(f"{table_name} table exists with columns:")
+                for name, data_type, nullable, default in columns:
+                    null_note = "NULL" if nullable == "YES" else "NOT NULL"
+                    default_note = f" DEFAULT {default}" if default else ""
+                    print(f"  {name:<14} {data_type:<26} {null_note}{default_note}")
+                print()
+
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ import React, {
 } from 'react';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 
+import {useAuth} from '@site/src/components/Auth/AuthContext';
 import {
   askBook,
   ChatApiError,
@@ -71,6 +72,7 @@ function useApiUrl(): string {
 
 export function ChatProvider({children}: {children: ReactNode}): ReactNode {
   const apiUrl = useApiUrl();
+  const {token} = useAuth();
 
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -123,16 +125,20 @@ export function ChatProvider({children}: {children: ReactNode}): ReactNode {
       try {
         let reply;
         try {
-          reply = await askBook(apiUrl, {
-            ...request,
-            ...(sessionId.current ? {session_id: sessionId.current} : {}),
-          });
+          reply = await askBook(
+            apiUrl,
+            {
+              ...request,
+              ...(sessionId.current ? {session_id: sessionId.current} : {}),
+            },
+            token,
+          );
         } catch (error) {
           // The service restarted, or history was cleared, and our id no longer
           // names a conversation. Start a fresh one rather than lose the question.
           if (error instanceof ChatApiError && error.code === 'unknown_session') {
             sessionId.current = null;
-            reply = await askBook(apiUrl, request);
+            reply = await askBook(apiUrl, request, token);
           } else {
             throw error;
           }
@@ -157,7 +163,7 @@ export function ChatProvider({children}: {children: ReactNode}): ReactNode {
         setPending(false);
       }
     },
-    [apiUrl, pending, push, selection],
+    [apiUrl, pending, push, selection, token],
   );
 
   const value = useMemo(

@@ -19,6 +19,10 @@ attrs==26.1.0
     # via
     #   jsonschema
     #   referencing
+bcrypt==4.0.1
+    # via
+    #   backend
+    #   passlib
 brotli==1.2.0
     # via gradio
 certifi==2026.7.22
@@ -150,6 +154,8 @@ packaging==26.3
     #   spaces
 pandas==3.0.5
     # via gradio
+passlib==1.7.4
+    # via backend
 pillow==12.3.0
     # via gradio
 portalocker==3.2.0
@@ -187,7 +193,9 @@ pydub==0.25.1
 pygments==2.21.0
     # via rich
 pyjwt==2.13.0
-    # via mcp
+    # via
+    #   backend
+    #   mcp
 python-dateutil==2.9.0.post0
     # via pandas
 python-dotenv==1.2.2

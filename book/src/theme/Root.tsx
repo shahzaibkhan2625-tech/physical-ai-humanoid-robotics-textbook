@@ -17,6 +17,8 @@ import BrowserOnly from '@docusaurus/BrowserOnly';
 import ChatWidget from '@site/src/components/ChatWidget';
 import {ChatProvider} from '@site/src/components/ChatWidget/ChatContext';
 import SelectionAsk from '@site/src/components/SelectionAsk';
+import AuthButton from '@site/src/components/Auth';
+import {AuthProvider} from '@site/src/components/Auth/AuthContext';
 
 export default function Root({children}: {children: ReactNode}): ReactNode {
   return (
@@ -24,10 +26,13 @@ export default function Root({children}: {children: ReactNode}): ReactNode {
       {children}
       <BrowserOnly>
         {() => (
-          <ChatProvider>
-            <SelectionAsk />
-            <ChatWidget />
-          </ChatProvider>
+          <AuthProvider>
+            <ChatProvider>
+              <AuthButton />
+              <SelectionAsk />
+              <ChatWidget />
+            </ChatProvider>
+          </AuthProvider>
         )}
       </BrowserOnly>
     </>

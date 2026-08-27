@@ -32,10 +32,12 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from os import getenv
 from pathlib import Path
 from typing import Any, Literal
 
+import jwt
 import psycopg
 from agents import (
     Agent,
@@ -50,6 +52,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
+from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from qdrant_client import AsyncQdrantClient
 
@@ -95,12 +98,18 @@ MAX_QUESTION_CHARS = 2_000
 MAX_SELECTED_CHARS = 8_000
 HISTORY_TURNS = 6  # prior turns replayed as conversation context
 MAX_TRANSLATE_CHARS = 50_000  # generous enough for a full chapter
+MAX_EMAIL_CHARS = 254  # RFC 5321 practical limit
+MIN_PASSWORD_CHARS = 8
+MAX_PASSWORD_CHARS = 72  # bcrypt's own hard limit is 72 bytes; reject rather than let it truncate silently
 
 EMBED_TIMEOUT_S = 15.0
 SEARCH_TIMEOUT_S = 15.0
 GENERATE_TIMEOUT_S = 30.0
 DB_TIMEOUT_S = 10.0
 TRANSLATE_TIMEOUT_S = 60.0  # a full chapter is a much larger generation than a chat answer
+
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = int(getenv("JWT_EXPIRE_MINUTES", "1440"))  # 24h
 
 CORS_ORIGINS = [
     o.strip() for o in getenv("CORS_ORIGINS", "*").split(",") if o.strip()
@@ -238,6 +247,25 @@ class HistoryResponse(BaseModel):
     turns: list[Turn]
 
 
+class SignupRequest(BaseModel):
+    email: str = Field(..., description="Email address to register.")
+    password: str = Field(..., description="Plain-text password; never stored as-is.")
+
+
+class SignupResponse(BaseModel):
+    message: str
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., description="Registered email address.")
+    password: str = Field(..., description="Account password.")
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
 # --- errors --------------------------------------------------------------------
 
 ErrorCode = Literal[
@@ -246,6 +274,7 @@ ErrorCode = Literal[
     "index_not_built",
     "dependency_unavailable",
     "timeout",
+    "invalid_credentials",
 ]
 
 
@@ -306,6 +335,11 @@ async def lifespan(app: FastAPI):
         # Low but not zero: grounded summarising, not creative writing.
         model_settings=ModelSettings(temperature=0.2),
     )
+
+    # Auth is a separate concern from the chat/RAG requirements above: soft-warn
+    # rather than block startup, since /chat and /translate do not need it.
+    if not getenv("JWT_SECRET_KEY"):
+        log.warning("JWT_SECRET_KEY is not set; /signup will work but /login will fail")
 
     log.info(
         "ready | model=%s embed=%s collection=%s threshold=%.2f history=%s",
@@ -628,6 +662,63 @@ async def translate_text(text: str) -> str:
     return (response.text or "").strip()
 
 
+# --- auth (signup / login) ------------------------------------------------------
+
+# Independent of the RAG pipeline and the translation cache above: its own
+# table (users), its own validation, its own errors.
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Hashed once at import time and verified against on every "email not found"
+# path in /login, so that path costs the same bcrypt work as a real wrong-
+# password check. Without this, response time alone would reveal whether an
+# email is registered, defeating the point of a generic "invalid credentials"
+# error.
+_DUMMY_PASSWORD_HASH = pwd_context.hash("not-a-real-account-timing-guard")
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    return pwd_context.verify(password, password_hash)
+
+
+def create_access_token(email: str) -> str:
+    secret = getenv("JWT_SECRET_KEY")
+    if not secret:
+        raise RuntimeError("JWT_SECRET_KEY is not configured")
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": email,
+        "iat": now,
+        "exp": now + timedelta(minutes=JWT_EXPIRE_MINUTES),
+    }
+    return jwt.encode(payload, secret, algorithm=JWT_ALGORITHM)
+
+
+def _insert_user(email: str, password_hash: str) -> None:
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (email, password_hash) VALUES (%s, %s);",
+                (email, password_hash),
+            )
+        conn.commit()
+
+
+def _select_user(email: str) -> tuple[str, str] | None:
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT email, password_hash FROM users WHERE email = %s;",
+            (email,),
+        )
+        return cur.fetchone()
+
+
 # --- endpoints -----------------------------------------------------------------
 
 
@@ -910,3 +1001,94 @@ async def translate(request: TranslateRequest) -> TranslateResponse:
     _translation_cache[chapter_id] = translated
     log.info("translated | chapter=%s chars=%d -> %d", chapter_id, len(text), len(translated))
     return TranslateResponse(translated_text=translated, chapter_id=chapter_id, cached=False)
+
+
+@app.post("/signup", response_model=SignupResponse)
+async def signup(request: SignupRequest) -> SignupResponse:
+    email = (request.email or "").strip().lower()
+    password = request.password or ""
+
+    if not email or not EMAIL_RE.match(email):
+        raise fail(400, "bad_request", "'email' must be a valid email address.")
+    if len(email) > MAX_EMAIL_CHARS:
+        raise fail(
+            400,
+            "bad_request",
+            f"'email' is {len(email)} characters; the limit is {MAX_EMAIL_CHARS}.",
+        )
+    if len(password) < MIN_PASSWORD_CHARS:
+        raise fail(
+            400,
+            "bad_request",
+            f"'password' must be at least {MIN_PASSWORD_CHARS} characters.",
+        )
+    if len(password) > MAX_PASSWORD_CHARS:
+        raise fail(
+            400,
+            "bad_request",
+            f"'password' is {len(password)} characters; the limit is {MAX_PASSWORD_CHARS}.",
+        )
+
+    if not clients.database_url:
+        raise fail(503, "dependency_unavailable", "Signup is temporarily unavailable.")
+
+    password_hash = hash_password(password)
+
+    try:
+        await query(_insert_user, email, password_hash)
+    except psycopg.errors.UniqueViolation:
+        raise fail(409, "bad_request", "An account with that email already exists.")
+    except Exception as exc:  # noqa: BLE001
+        log.error("signup failed: %r", exc)
+        raise fail(
+            503,
+            "dependency_unavailable",
+            "Signup is temporarily unavailable. Please try again shortly.",
+        )
+
+    log.info("signup | email=%s", email)
+    return SignupResponse(message="Account created. You can now log in.")
+
+
+@app.post("/login", response_model=LoginResponse)
+async def login(request: LoginRequest) -> LoginResponse:
+    email = (request.email or "").strip().lower()
+    password = request.password or ""
+
+    if not email or not password:
+        raise fail(400, "bad_request", "'email' and 'password' are required.")
+
+    if not clients.database_url:
+        raise fail(503, "dependency_unavailable", "Login is temporarily unavailable.")
+
+    # Same message and status regardless of cause (unknown email vs wrong
+    # password) - which one failed is not the client's business.
+    invalid_credentials = fail(401, "invalid_credentials", "Invalid email or password.")
+
+    try:
+        row = await query(_select_user, email)
+    except Exception as exc:  # noqa: BLE001
+        log.error("login lookup failed: %r", exc)
+        raise fail(
+            503,
+            "dependency_unavailable",
+            "Login is temporarily unavailable. Please try again shortly.",
+        )
+
+    if row is None:
+        # Pay the same bcrypt cost as a real check (see _DUMMY_PASSWORD_HASH).
+        verify_password(password, _DUMMY_PASSWORD_HASH)
+        raise invalid_credentials
+
+    _, password_hash = row
+    if not verify_password(password, password_hash):
+        raise invalid_credentials
+
+    try:
+        token = create_access_token(email)
+    except RuntimeError:
+        log.error("login succeeded but JWT_SECRET_KEY is not configured")
+        raise fail(503, "dependency_unavailable", "Login is temporarily unavailable.")
+
+    log.info("login | email=%s", email)
+    return LoginResponse(access_token=token)

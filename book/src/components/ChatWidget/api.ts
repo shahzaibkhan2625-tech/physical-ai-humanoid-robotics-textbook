@@ -70,10 +70,15 @@ function readError(status: number, body: unknown): ChatApiError {
   );
 }
 
-/** Ask the book a question. Rejects with a ChatApiError the caller can render. */
+/** Ask the book a question. Rejects with a ChatApiError the caller can render.
+ *
+ * `token` is optional — chat works the same for a logged-out reader (see
+ * AuthContext); when present it just rides along as a Bearer header.
+ */
 export async function askBook(
   baseUrl: string,
   request: ChatRequest,
+  token?: string | null,
 ): Promise<ChatResponse> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -82,7 +87,10 @@ export async function askBook(
   try {
     response = await fetch(`${baseUrl.replace(/\/+$/, '')}/chat`, {
       method: 'POST',
-      headers: {'Content-Type': 'application/json'},
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? {Authorization: `Bearer ${token}`} : {}),
+      },
       body: JSON.stringify(request),
       signal: controller.signal,
     });
