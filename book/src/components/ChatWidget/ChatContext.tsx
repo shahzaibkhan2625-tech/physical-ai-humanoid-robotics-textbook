@@ -12,6 +12,7 @@ import React, {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -88,6 +89,20 @@ export function ChatProvider({children}: {children: ReactNode}): ReactNode {
     nextId.current += 1;
     setMessages((current) => [...current, {...message, id: nextId.current}]);
   }, []);
+
+  // A login or logout changes `token`. Either way the reader is no longer the
+  // one who owned the previous conversation, so drop it and let the next
+  // question start a fresh session rather than continuing someone else's.
+  const previousToken = useRef(token);
+  useEffect(() => {
+    if (previousToken.current === token) {
+      return;
+    }
+    previousToken.current = token;
+    sessionId.current = null;
+    setMessages([]);
+    setSelection(null);
+  }, [token]);
 
   const openChat = useCallback(() => setOpen(true), []);
   const closeChat = useCallback(() => setOpen(false), []);
