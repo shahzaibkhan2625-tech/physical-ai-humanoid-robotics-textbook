@@ -3,9 +3,10 @@
  *
  * Mounted once by the swizzled Root (src/theme/Root.tsx), so it survives
  * client-side navigation between chapters: a reader can ask a question, follow a
- * link, and keep the thread. It does not survive a reload, by design — the
- * session id lives in a ref and nothing is written to localStorage or any other
- * browser storage.
+ * link, and keep the thread. The session id and messages are mirrored to
+ * localStorage, so a reload continues the same conversation; Root mounts this
+ * provider inside BrowserOnly, so there is no SSR/hydration pass to keep in
+ * sync with.
  */
 
 import React, {
@@ -55,6 +56,35 @@ type ChatContextValue = {
   send: (question: string) => void;
 };
 
+const STORAGE_KEY = 'textbook-chat-session';
+
+type StoredChat = {sessionId: string | null; messages: Message[]};
+
+function readStoredChat(): StoredChat | null {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const stored = JSON.parse(raw) as Partial<StoredChat>;
+    if (!Array.isArray(stored.messages)) {
+      return null;
+    }
+    return {sessionId: stored.sessionId ?? null, messages: stored.messages};
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredChat(sessionId: string | null, messages: Message[]): void {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({sessionId, messages}));
+  } catch {
+    // Storage full or unavailable — the conversation still works, it just
+    // won't survive a reload.
+  }
+}
+
 const ChatContext = createContext<ChatContextValue | null>(null);
 
 export function useChat(): ChatContextValue {
@@ -75,15 +105,31 @@ export function ChatProvider({children}: {children: ReactNode}): ReactNode {
   const apiUrl = useApiUrl();
   const {token} = useAuth();
 
+  // Read once per mount and share the result between the session ref and the
+  // messages initializer below, rather than hitting localStorage twice.
+  const restored = useRef<StoredChat | null | undefined>(undefined);
+  if (restored.current === undefined) {
+    restored.current = readStoredChat();
+  }
+
   const [open, setOpen] = useState(false);
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<Message[]>(() => restored.current?.messages ?? []);
   const [pending, setPending] = useState(false);
   const [selection, setSelection] = useState<string | null>(null);
 
   // The backend mints the session id on the first turn; we hold it for the rest
   // of this browser session and send it back so follow-ups resolve in context.
-  const sessionId = useRef<string | null>(null);
-  const nextId = useRef(0);
+  const sessionId = useRef<string | null>(restored.current?.sessionId ?? null);
+  const nextId = useRef(
+    restored.current?.messages.reduce((max, message) => Math.max(max, message.id), 0) ?? 0,
+  );
+
+  // Keep localStorage in sync with the conversation. This also covers the
+  // token-change reset below: it clears `messages`, which re-runs this effect
+  // and persists the cleared state.
+  useEffect(() => {
+    writeStoredChat(sessionId.current, messages);
+  }, [messages]);
 
   const push = useCallback((message: Omit<Message, 'id'>) => {
     nextId.current += 1;

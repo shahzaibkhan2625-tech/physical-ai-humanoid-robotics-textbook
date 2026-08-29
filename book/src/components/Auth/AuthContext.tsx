@@ -2,9 +2,10 @@
  * Auth state for the whole site.
  *
  * Mounted once by the swizzled Root (src/theme/Root.tsx), so it survives
- * client-side navigation between chapters. Like ChatContext's session id, the
- * token lives only in React state — nothing is written to localStorage or any
- * other browser storage, so a reload logs the reader out.
+ * client-side navigation between chapters. The token and email are mirrored to
+ * localStorage so a reload restores the logged-in state; Root mounts this
+ * provider inside BrowserOnly, so there is no SSR/hydration pass to keep in
+ * sync with.
  */
 
 import React, {
@@ -12,6 +13,7 @@ import React, {
   useCallback,
   useContext,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react';
@@ -23,6 +25,66 @@ import {
   AuthApiError,
   type ExperienceLevel,
 } from './api';
+
+const STORAGE_KEY = 'textbook-auth';
+
+type StoredAuth = {token: string; email: string};
+
+/** The token's `exp` claim, read without verifying the signature — that is the
+ * backend's job. This is only a local, best-effort check so an obviously dead
+ * token does not sit in localStorage pretending to be a session. */
+function isTokenExpired(token: string): boolean {
+  try {
+    const payload = token.split('.')[1];
+    const base64 = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
+    const {exp} = JSON.parse(atob(padded)) as {exp?: number};
+    return typeof exp === 'number' && Date.now() >= exp * 1000;
+  } catch {
+    return true;
+  }
+}
+
+function readStoredAuth(): StoredAuth | null {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const stored = JSON.parse(raw) as Partial<StoredAuth>;
+    if (!stored.token || !stored.email || isTokenExpired(stored.token)) {
+      window.localStorage.removeItem(STORAGE_KEY);
+      return null;
+    }
+    return {token: stored.token, email: stored.email};
+  } catch {
+    // Corrupt JSON, or storage unavailable (e.g. private browsing) — treat as
+    // logged out rather than crash.
+    try {
+      window.localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      // Nothing more we can do.
+    }
+    return null;
+  }
+}
+
+function writeStoredAuth(token: string, email: string): void {
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({token, email}));
+  } catch {
+    // Storage full or unavailable — the session still works, it just won't
+    // survive a reload.
+  }
+}
+
+function clearStoredAuth(): void {
+  try {
+    window.localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // Nothing more we can do.
+  }
+}
 
 type AuthContextValue = {
   token: string | null;
@@ -54,8 +116,15 @@ function useApiUrl(): string {
 export function AuthProvider({children}: {children: ReactNode}): ReactNode {
   const apiUrl = useApiUrl();
 
-  const [token, setToken] = useState<string | null>(null);
-  const [email, setEmail] = useState<string | null>(null);
+  // Read once per mount and share the result between both initializers below,
+  // rather than hitting localStorage twice.
+  const restored = useRef<StoredAuth | null | undefined>(undefined);
+  if (restored.current === undefined) {
+    restored.current = readStoredAuth();
+  }
+
+  const [token, setToken] = useState<string | null>(() => restored.current?.token ?? null);
+  const [email, setEmail] = useState<string | null>(() => restored.current?.email ?? null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -67,8 +136,10 @@ export function AuthProvider({children}: {children: ReactNode}): ReactNode {
       setError(null);
       try {
         const result = await loginRequest(apiUrl, emailInput, password);
+        const normalizedEmail = emailInput.trim().toLowerCase();
         setToken(result.access_token);
-        setEmail(emailInput.trim().toLowerCase());
+        setEmail(normalizedEmail);
+        writeStoredAuth(result.access_token, normalizedEmail);
       } catch (cause) {
         setError(
           cause instanceof AuthApiError
@@ -92,8 +163,10 @@ export function AuthProvider({children}: {children: ReactNode}): ReactNode {
         // Signing up and then having to sign in again is friction the reader
         // does not need — go straight to a logged-in state.
         const result = await loginRequest(apiUrl, emailInput, password);
+        const normalizedEmail = emailInput.trim().toLowerCase();
         setToken(result.access_token);
-        setEmail(emailInput.trim().toLowerCase());
+        setEmail(normalizedEmail);
+        writeStoredAuth(result.access_token, normalizedEmail);
       } catch (cause) {
         setError(
           cause instanceof AuthApiError
@@ -111,6 +184,7 @@ export function AuthProvider({children}: {children: ReactNode}): ReactNode {
   const logout = useCallback(() => {
     setToken(null);
     setEmail(null);
+    clearStoredAuth();
   }, []);
 
   const value = useMemo(
