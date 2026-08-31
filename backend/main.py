@@ -106,7 +106,7 @@ EMBED_TIMEOUT_S = 15.0
 SEARCH_TIMEOUT_S = 15.0
 GENERATE_TIMEOUT_S = 30.0
 DB_TIMEOUT_S = 10.0
-TRANSLATE_TIMEOUT_S = 150.0  # a full ~50k-char chapter measured ~110s end-to-end; leave headroom
+TRANSLATE_TIMEOUT_S = 300.0  # HF Space is slower than local dev (local ~106-110s exceeded 150s on HF); leave headroom
 
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = int(getenv("JWT_EXPIRE_MINUTES", "1440"))  # 24h

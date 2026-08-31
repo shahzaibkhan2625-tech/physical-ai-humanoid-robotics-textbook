@@ -5,8 +5,8 @@
  * shown to the reader by cause, not collapsed into "something broke".
  */
 
-/** Above the backend's own translation timeout (150s), so its message wins. */
-const REQUEST_TIMEOUT_MS = 155_000;
+/** Above the backend's own translation timeout (300s), so its message wins. */
+const REQUEST_TIMEOUT_MS = 305_000;
 
 export type TranslateResponse = {
   translated_text: string;
